@@ -36,10 +36,51 @@ enum MaterialPass {
 
 #[derive(Clone, Default)]
 pub struct GeomMaterial {
+    // surface color texture currently applied first enabled entry of color_layers
     pub texture: Option<Arc<Texture2D>>,
     pub is_vehicle_paint: bool,
     pass: MaterialPass,
     auxiliary_pass: bool,
+    // tinted opaque vehicle body material shown as car paint while no color texture is applied
+    paint_capable: bool,
+    // indices into mesh tex_layers color candidates in priority order
+    color_layers: Vec<u16>,
+    normal_layers: Vec<u16>,
+    overlay_layers: Vec<u16>,
+    // normal map and multiply overlays currently applied
+    normal: Option<Arc<Texture2D>>,
+    overlays: Vec<Arc<Texture2D>>,
+}
+
+// how an applied texture layer contributes to the preview
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TexLayerKind {
+    // surface color
+    Color,
+    // tangent space normal map that perturbs the lighting
+    Normal,
+    // dirt dust and mask maps multiplied over the surface
+    Overlay,
+}
+
+// one pooled texture bound by the materials of a mesh that can be switched on or off in the preview
+#[derive(Clone)]
+pub struct TexLayer {
+    pub hash64: u64,
+    pub label: String,
+    pub kind: TexLayerKind,
+    pub w: usize,
+    pub h: usize,
+    // pool file and descriptor index
+    pub source: String,
+    // number of drawn geometries whose material binds it
+    pub mats: usize,
+    pub enabled: bool,
+    // part of the default look
+    pub default_on: bool,
+    hit: crate::tex::TtpfHashHit,
+    tex: Option<Arc<Texture2D>>,
+    failed: bool,
 }
 
 impl GeomMaterial {
@@ -90,6 +131,8 @@ pub struct Mesh3D {
     pub edges: Vec<(u32, u32)>,
     pub texture: Option<Texture2D>,
     pub geom_materials: Vec<GeomMaterial>,
+    // pooled textures bound by the materials toggled from the viewer
+    pub tex_layers: Vec<TexLayer>,
     pub has_paint_geom: bool,
     pub paint_color: [f32; 3],
     pub tex_status: String,
@@ -99,6 +142,9 @@ pub struct Mesh3D {
     pub meshlet_count: usize,
     pub bone_count: usize,
     pub lod_label: String,
+    // decoded lod level and geometry count per level all zero when the resource has no lod table
+    pub lod: usize,
+    pub lod_geoms: [usize; MAX_LODS],
     // separate drawables in dictionary entries empty for single drawable meshes
     pub parts: Vec<MeshPart>,
     // none shows every part on grid some isolates a single part
@@ -124,6 +170,72 @@ pub struct Mesh3D {
 }
 
 impl Mesh3D {
+    // rebinds every material to its enabled texture layers decoding newly enabled ones on demand
+    pub fn apply_tex_layers(&mut self) {
+        let mut budget = 384usize;
+        for l in &mut self.tex_layers {
+            if l.enabled && l.tex.is_none() && !l.failed && budget > 0 {
+                budget -= 1;
+                l.tex = crate::tex::decode_ttpf_texture_cached(&l.hit, l.hash64);
+                l.failed = l.tex.is_none();
+            }
+        }
+        let layers = &self.tex_layers;
+        let live = |ids: &[u16]| -> Vec<Arc<Texture2D>> {
+            ids.iter()
+                .filter_map(|&i| layers.get(i as usize))
+                .filter(|l| l.enabled)
+                .filter_map(|l| l.tex.clone())
+                .collect()
+        };
+        for m in &mut self.geom_materials {
+            // highest priority ticked color layer wins even when it could not be decoded
+            m.texture = m.color_layers.iter().filter_map(|&i| layers.get(i as usize)).find(|l| l.enabled).and_then(|l| l.tex.clone());
+            m.normal = live(&m.normal_layers).into_iter().next();
+            m.overlays = live(&m.overlay_layers);
+            if matches!(m.pass, MaterialPass::Glass { .. }) {
+                if m.texture.as_ref().is_some_and(|t| t.w <= 4 && t.h <= 4 && t.pixels.iter().all(|p| p.a() == 0)) {
+                    m.texture = None;
+                }
+                m.pass = MaterialPass::Glass {
+                    texture_alpha: m.texture.as_ref().is_some_and(|t| t.pixels.iter().any(|p| p.a() < 255)),
+                };
+            }
+            // an enabled color texture that failed to decode keeps the neutral material look instead of paint
+            let color_bound = m.color_layers.iter().any(|&i| layers.get(i as usize).is_some_and(|l| l.enabled));
+            m.is_vehicle_paint = m.paint_capable && !color_bound;
+        }
+        self.has_paint_geom = self.geom_materials.iter().any(|m| m.paint_capable);
+        self.refresh_tex_status();
+        self.dirty = true;
+    }
+
+    // switches layers on or off by predicate and reapplies them
+    pub fn set_tex_layers(&mut self, on: impl Fn(&TexLayer) -> bool) {
+        for l in &mut self.tex_layers {
+            l.enabled = on(l);
+        }
+        self.apply_tex_layers();
+    }
+
+    fn refresh_tex_status(&mut self) {
+        if self.texture.is_some() || self.geom_materials.is_empty() {
+            return;
+        }
+        let textured = self.geom_materials.iter().filter(|m| m.texture.is_some()).count();
+        let paint = self.geom_materials.iter().filter(|m| m.is_vehicle_paint).count();
+        let drawn = self.geom_materials.iter().filter(|m| !m.auxiliary_pass).count().max(1);
+        if textured > 0 && paint > 0 {
+            self.tex_status = format!("TTPF: {textured}/{drawn} mats + Car Paint");
+        } else if textured > 0 {
+            self.tex_status = format!("TTPF: {textured}/{drawn} mats");
+        } else if paint > 0 {
+            self.tex_status = format!("Car Paint ({paint}/{drawn} geoms)");
+        } else if !self.tex_layers.is_empty() {
+            self.tex_status = "TTPF: no color textures applied".into();
+        }
+    }
+
     pub fn from_parts(
         name: String,
         verts: Vec<[f32; 3]>,
@@ -192,6 +304,7 @@ impl Mesh3D {
             texture,
             geom_materials: Vec::new(),
             has_paint_geom: false,
+            tex_layers: Vec::new(),
             paint_color: DEFAULT_PAINT_COLOR,
             tex_status,
             center,
@@ -200,6 +313,8 @@ impl Mesh3D {
             meshlet_count,
             bone_count: 0,
             lod_label,
+            lod: 0,
+            lod_geoms: [0; MAX_LODS],
             parts: Vec::new(),
             active_part: None,
             yaw: DEFAULT_YAW,
@@ -683,12 +798,16 @@ fn resolve_meshlet_buffer(v: &[u8], link_ptr: u64) -> Option<(usize, usize)> {
 // one meshlet geometry vb phys offset vb bytes mb phys offset mb bytes
 type GeomRef = (usize, usize, usize, usize);
 
-// lod0 high detail meshlet geometries of drawable at base
-fn drawable_lod0_geoms(v: &[u8], base: usize) -> Vec<GeomRef> {
+// drawable lod slots high med low vlow at +0x50 +0x58 +0x60 +0x68
+pub const MAX_LODS: usize = 4;
+pub const LOD_NAMES: [&str; MAX_LODS] = ["LOD0", "LOD1", "LOD2", "LOD3"];
+
+// meshlet geometries of one lod level of drawable at base lod 0 is high detail
+fn drawable_lod_geoms(v: &[u8], base: usize, lod: usize) -> Vec<GeomRef> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    if base + 0x80 > v.len() { return out; }
-    let Some(lod0_off) = vptr(ru64(v, base + 0x50)) else { return out };
+    if lod >= MAX_LODS || base + 0x80 > v.len() { return out; }
+    let Some(lod0_off) = vptr(ru64(v, base + 0x50 + lod * 8)) else { return out };
     if lod0_off + 0x10 > v.len() { return out; }
     let Some(models_off) = vptr(ru64(v, lod0_off)) else { return out };
     let model_cnt = ru16(v, lod0_off + 8) as usize;
@@ -767,11 +886,11 @@ fn try_extract_embedded_texture(v: &[u8], p: &[u8]) -> (Option<Texture2D>, Strin
     (None, "External .#td (Material Shading)".into())
 }
 
-// maps each lod0 vb and mb offset of drawable at base to its shader index and render mask
-fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), (u16, u8)> {
+// maps each vb and mb offset of one lod of drawable at base to its shader index and render mask
+fn drawable_lod_shader_map(v: &[u8], base: usize, lod: usize) -> HashMap<(usize, usize), (u16, u8)> {
     let mut out = HashMap::new();
-    if base + 0x80 > v.len() { return out; }
-    let Some(lod0_off) = vptr(ru64(v, base + 0x50)) else { return out };
+    if lod >= MAX_LODS || base + 0x80 > v.len() { return out; }
+    let Some(lod0_off) = vptr(ru64(v, base + 0x50 + lod * 8)) else { return out };
     if lod0_off + 0x10 > v.len() { return out; }
     let Some(models_off) = vptr(ru64(v, lod0_off)) else { return out };
     let model_cnt = ru16(v, lod0_off + 8) as usize;
@@ -801,15 +920,136 @@ fn drawable_lod0_shader_map(v: &[u8], base: usize) -> HashMap<(usize, usize), (u
     out
 }
 
+// texture parameters of the shader at saddr as param name hash and bound 64 bit texture hash none when the slot is empty
+fn shader_texture_params(v: &[u8], saddr: usize) -> Vec<(u32, Option<u64>)> {
+    let mut out = Vec::new();
+    if saddr + 0x28 > v.len() { return out; }
+    let (Some(p2), Some(p4)) = (vptr(ru64(v, saddr + 0x10)), vptr(ru64(v, saddr + 0x20))) else { return out };
+    if p4 + 8 > v.len() { return out; }
+    let tcnt = (v[p4 + 1] as usize).min(48);
+    for k in 0..tcnt {
+        let ent = p4 + 8 + k * 8;
+        if ent + 8 > v.len() { break; }
+        let param_hash = ru32(v, ent);
+        let slot = (ru32(v, ent + 4) / 4) as usize;
+        let tex_hash = (|| {
+            if p2 + slot * 8 + 8 > v.len() { return None; }
+            let tp = vptr(ru64(v, p2 + slot * 8))?;
+            if tp + 0x40 > v.len() || ru64(v, tp + 0x10) != 0x980 { return None; }
+            let ref_off = vptr(ru64(v, tp + 0x30))?;
+            if ref_off + 16 > v.len() { return None; }
+            Some(ru64(v, ref_off + 8))
+        })();
+        out.push((param_hash, tex_hash));
+    }
+    out
+}
+
+// shader addresses of the shader group of drawable at base
+fn drawable_shader_addrs(v: &[u8], base: usize) -> Vec<usize> {
+    if base + 0x18 > v.len() { return Vec::new(); }
+    let Some(sg) = vptr(ru64(v, base + 0x10)) else { return Vec::new() };
+    if sg + 0x20 > v.len() { return Vec::new(); }
+    let Some(sp) = vptr(ru64(v, sg + 0x10)) else { return Vec::new() };
+    let scnt = ru16(v, sg + 0x18) as usize;
+    if scnt == 0 || scnt > 512 || sp + scnt * 8 > v.len() { return Vec::new(); }
+    // verify rage9 atem meta shader table tag
+    let Some(s0) = vptr(ru64(v, sp)) else { return Vec::new() };
+    if s0 + 8 > v.len() || (ru64(v, s0) >> 32) != 0x6d65_7461 { return Vec::new(); }
+    (0..scnt).filter_map(|i| vptr(ru64(v, sp + i * 8))).collect()
+}
+
+// known shader texture parameter names by joaat hash
+pub fn texture_param_name(param_hash: u32) -> Option<&'static str> {
+    Some(match param_hash {
+        0xc8e8_c282 => "diffuseTex",
+        0x2c8d_7182 => "tintPaletteTex",
+        0x8e0d_63ee => "emissiveTex",
+        0x7485_dafb => "dirtDiffuseTex",
+        0xcc15_5f4b => "dirtNoiseTex",
+        0xfb03_ae36 => "DustTexture",
+        _ => return None,
+    })
+}
+
+// one external texture a model binds in its shaders
+#[derive(Clone, Debug)]
+pub struct ModelTexRef {
+    pub hash64: u64,
+    // shader parameters this texture is bound to
+    pub params: Vec<u32>,
+    // number of shaders that bind it
+    pub shaders: usize,
+    // location in the ttpf pools none when no pool holds this hash
+    pub hit: Option<crate::tex::TtpfHashHit>,
+}
+
+impl ModelTexRef {
+    // short role label from the parameter name or the pixel format
+    pub fn role(&self) -> String {
+        if let Some(n) = self.params.iter().find_map(|&p| texture_param_name(p)) {
+            return n.to_string();
+        }
+        let kind = match &self.hit {
+            Some(h) if h.is_normal_format() => "normal",
+            Some(h) if h.is_srgb() => "color",
+            Some(_) => "linear",
+            None => "param",
+        };
+        format!("{kind}_{:08x}", self.params.first().copied().unwrap_or(0))
+    }
+}
+
+// every external texture bound by the shaders of the model at file_off in first use order
+pub fn list_model_texture_refs(rpf_path: &Path, file_off: u64) -> Result<Vec<ModelTexRef>, String> {
+    let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
+    let (v, _, _) = read_virtual_from_file(&mut f, file_off)?;
+    let mut bases: Vec<usize> = drawable_dictionary_entries(&v).into_iter().map(|(_, b)| b).collect();
+    if bases.is_empty() {
+        bases.push(0);
+        if v.len() >= 0x20 {
+            if let Some(fo) = vptr(ru64(&v, 0x18)) {
+                bases.push(fo);
+            }
+        }
+    }
+    let idx = crate::tex::ttpf_hash_index_for_rpf(rpf_path);
+    let mut out: Vec<ModelTexRef> = Vec::new();
+    let mut pos: HashMap<u64, usize> = HashMap::new();
+    let mut seen_shaders = HashSet::new();
+    for base in bases {
+        for saddr in drawable_shader_addrs(&v, base) {
+            if !seen_shaders.insert(saddr) { continue; }
+            let mut in_shader = HashSet::new();
+            for (param, tex_hash) in shader_texture_params(&v, saddr) {
+                let Some(h64) = tex_hash else { continue };
+                let i = *pos.entry(h64).or_insert_with(|| {
+                    out.push(ModelTexRef {
+                        hash64: h64,
+                        params: Vec::new(),
+                        shaders: 0,
+                        hit: idx.as_ref().and_then(|m| m.get(&h64).cloned()),
+                    });
+                    out.len() - 1
+                });
+                if !out[i].params.contains(&param) { out[i].params.push(param); }
+                if in_shader.insert(h64) { out[i].shaders += 1; }
+            }
+        }
+    }
+    Ok(out)
+}
+
 // resolves external ttpf diffuse textures and vehicle paint shader flags for lod0 geoms
 fn resolve_drawable_materials(
     v: &[u8],
     base: usize,
+    lod: usize,
     geoms: &[GeomRef],
     ttpf_idx: Option<&HashMap<u64, crate::tex::TtpfHashHit>>,
     is_vehicle: bool,
-    seen_hashes: &mut HashSet<u64>,
-    decode_budget: &mut usize,
+    layers: &mut Vec<TexLayer>,
+    layer_pos: &mut HashMap<u64, u16>,
 ) -> Vec<GeomMaterial> {
     const DIFFUSE_TEX: u32 = 0xc8e8_c282; // diffuseTex
     const TINT_PALETTE_TEX: u32 = 0x2c8d_7182; // tintPaletteTex
@@ -830,7 +1070,7 @@ fn resolve_drawable_materials(
     let Some(s0) = vptr(ru64(v, sp)) else { return mats };
     if s0 + 8 > v.len() || (ru64(v, s0) >> 32) != 0x6d65_7461 { return mats; }
 
-    let smap = drawable_lod0_shader_map(v, base);
+    let smap = drawable_lod_shader_map(v, base, lod);
     let has_main_pass = smap.values().any(|&(_, mask)| mask & 1 != 0);
     let mut shader_cache: HashMap<u16, GeomMaterial> = HashMap::new();
 
@@ -855,83 +1095,89 @@ fn resolve_drawable_materials(
                         Some(8) => MaterialPass::Cutout,
                         _ => MaterialPass::Opaque,
                     };
-                    if let (Some(p2), Some(p4)) = (vptr(ru64(v, saddr + 0x10)), vptr(ru64(v, saddr + 0x20))) {
-                        if p4 + 8 <= v.len() {
-                            let tcnt = (v[p4 + 1] as usize).min(48);
-                            let mut has_tint = false;
-                            let mut diffuse_cand: Option<(u64, crate::tex::TtpfHashHit)> = None;
-                            let mut alt0_cand: Option<(u64, crate::tex::TtpfHashHit)> = None;
-                            let mut emissive_cand: Option<(u64, crate::tex::TtpfHashHit)> = None;
-                            let mut fallback_srgb: Option<(u64, crate::tex::TtpfHashHit)> = None;
-                            let uses_opacity = !matches!(mat.pass, MaterialPass::Opaque);
+                    let mut has_tint = false;
+                    let mut diffuse_cand: Option<u16> = None;
+                    let mut alt0_cand: Option<u16> = None;
+                    let mut emissive_cand: Option<u16> = None;
+                    let mut fallback_srgb: Option<u16> = None;
+                    let uses_opacity = !matches!(mat.pass, MaterialPass::Opaque);
+                    let mut layer_of = |h64: u64, hit: &crate::tex::TtpfHashHit, param: u32, kind: TexLayerKind| -> Option<u16> {
+                        if let Some(&i) = layer_pos.get(&h64) {
+                            return Some(i);
+                        }
+                        let i = u16::try_from(layers.len()).ok()?;
+                        let label = match (texture_param_name(param), kind) {
+                            (Some(n), _) => n.to_string(),
+                            (None, _) if param == ALT0_TEX => "liveryDetail".to_string(),
+                            (None, TexLayerKind::Color) => format!("color_{param:08x}"),
+                            (None, TexLayerKind::Normal) => format!("normal_{param:08x}"),
+                            (None, TexLayerKind::Overlay) => format!("overlay_{param:08x}"),
+                        };
+                        layers.push(TexLayer {
+                            hash64: h64,
+                            label,
+                            kind,
+                            w: hit.w,
+                            h: hit.h,
+                            source: format!("{} #{}", hit.path.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default(), hit.tex_idx),
+                            mats: 0,
+                            enabled: false,
+                            default_on: false,
+                            hit: hit.clone(),
+                            tex: None,
+                            failed: false,
+                        });
+                        layer_pos.insert(h64, i);
+                        Some(i)
+                    };
 
-                            for k in 0..tcnt {
-                                let ent = p4 + 8 + k * 8;
-                                if ent + 8 > v.len() { break; }
-                                let param_hash = ru32(v, ent);
-                                let slot = (ru32(v, ent + 4) / 4) as usize;
-                                if param_hash == TINT_PALETTE_TEX {
-                                    has_tint = true;
-                                }
-                                let Some(idx_map) = ttpf_idx else { continue };
-                                if p2 + slot * 8 + 8 > v.len() { continue; }
-                                let Some(tp) = vptr(ru64(v, p2 + slot * 8)) else { continue };
-                                if tp + 0x40 > v.len() || ru64(v, tp + 0x10) != 0x980 { continue; }
-                                let Some(ref_off) = vptr(ru64(v, tp + 0x30)) else { continue };
-                                if ref_off + 16 > v.len() { continue; }
-                                let h64 = ru64(v, ref_off + 8);
-                                let Some(hit) = idx_map.get(&h64) else { continue };
-                                if hit.is_normal_format() { continue; }
-                                if hit.dxgi == 65 && !(uses_opacity && param_hash == DIFFUSE_TEX) { continue; }
-
-                                if param_hash == DIFFUSE_TEX && hit.w >= 4 && hit.h >= 4 {
-                                    diffuse_cand = Some((h64, hit.clone()));
-                                } else if param_hash == ALT0_TEX && hit.w >= 16 && hit.h >= 16 {
-                                    alt0_cand = Some((h64, hit.clone()));
-                                } else if param_hash == EMISSIVE_TEX && hit.w >= 16 && hit.h >= 16 {
-                                    emissive_cand = Some((h64, hit.clone()));
-                                } else if hit.is_srgb()
-                                    && hit.w >= 16
-                                    && hit.h >= 16
-                                    && param_hash != DIRT_DIFFUSE_TEX
-                                    && param_hash != SHARED_LUT_PARAM
-                                    && fallback_srgb.is_none()
-                                {
-                                    fallback_srgb = Some((h64, hit.clone()));
-                                }
-                            }
-
-                            let chosen = if let Some(c) = diffuse_cand {
-                                Some(c)
-                            } else if has_tint && is_vehicle {
-                                alt0_cand
-                            } else {
-                                alt0_cand.or(emissive_cand).or(fallback_srgb)
-                            };
-
-                            let had_tex_ref = chosen.is_some();
-                            if let Some((h64, hit)) = chosen {
-                                let is_new = seen_hashes.insert(h64);
-                                if !is_new || *decode_budget > 0 {
-                                    if let Some(tex) = crate::tex::decode_ttpf_texture_cached(&hit, h64) {
-                                        mat.texture = Some(tex);
-                                        if is_new && *decode_budget > 0 {
-                                            *decode_budget -= 1;
-                                        }
-                                    }
+                    for (param_hash, tex_hash) in shader_texture_params(v, saddr) {
+                        if param_hash == TINT_PALETTE_TEX {
+                            has_tint = true;
+                        }
+                        let Some(idx_map) = ttpf_idx else { continue };
+                        let Some(h64) = tex_hash else { continue };
+                        let Some(hit) = idx_map.get(&h64) else { continue };
+                        let big = hit.w >= 16 && hit.h >= 16;
+                        if hit.is_normal_format() {
+                            if big {
+                                if let Some(i) = layer_of(h64, hit, param_hash, TexLayerKind::Normal) {
+                                    if !mat.normal_layers.contains(&i) { mat.normal_layers.push(i); }
                                 }
                             }
-                            if matches!(mat.pass, MaterialPass::Glass { .. }) {
-                                if mat.texture.as_ref().is_some_and(|t| t.w <= 4 && t.h <= 4 && t.pixels.iter().all(|p| p.a() == 0)) {
-                                    mat.texture = None;
-                                }
-                                mat.pass = MaterialPass::Glass {
-                                    texture_alpha: mat.texture.as_ref().is_some_and(|t| t.pixels.iter().any(|p| p.a() < 255)),
-                                };
+                            continue;
+                        }
+                        if hit.dxgi == 65 && !(uses_opacity && param_hash == DIFFUSE_TEX) { continue; }
+
+                        if param_hash == DIFFUSE_TEX && hit.w >= 4 && hit.h >= 4 {
+                            diffuse_cand = layer_of(h64, hit, param_hash, TexLayerKind::Color);
+                        } else if param_hash == ALT0_TEX && big {
+                            alt0_cand = layer_of(h64, hit, param_hash, TexLayerKind::Color);
+                        } else if param_hash == EMISSIVE_TEX && big {
+                            emissive_cand = layer_of(h64, hit, param_hash, TexLayerKind::Color);
+                        } else if hit.is_srgb()
+                            && big
+                            && param_hash != DIRT_DIFFUSE_TEX
+                            && param_hash != SHARED_LUT_PARAM
+                            && fallback_srgb.is_none()
+                        {
+                            fallback_srgb = layer_of(h64, hit, param_hash, TexLayerKind::Color);
+                        } else if big && param_hash != SHARED_LUT_PARAM {
+                            if let Some(i) = layer_of(h64, hit, param_hash, TexLayerKind::Overlay) {
+                                if !mat.overlay_layers.contains(&i) { mat.overlay_layers.push(i); }
                             }
-                            mat.is_vehicle_paint = is_vehicle && has_tint && !had_tex_ref && mat.pass == MaterialPass::Opaque;
                         }
                     }
+
+                    // color candidates in priority order tinted vehicle bodies only take diffuse or livery detail
+                    let tinted_body = has_tint && is_vehicle;
+                    let extra = if tinted_body { [None, None] } else { [emissive_cand, fallback_srgb] };
+                    for i in [diffuse_cand, alt0_cand].into_iter().chain(extra).flatten() {
+                        if !mat.color_layers.contains(&i) { mat.color_layers.push(i); }
+                    }
+                    // a texture already used as color or normal is not also multiplied over the same material
+                    mat.overlay_layers.retain(|i| !mat.color_layers.contains(i) && !mat.normal_layers.contains(i));
+                    mat.paint_capable = tinted_body && mat.pass == MaterialPass::Opaque;
                 }
             }
         }
@@ -1104,6 +1350,11 @@ fn extract_rage9_bone_count(v: &[u8]) -> usize {
 }
 
 pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
+    decode_rage9_model_from_rpf_lod(rpf_path, file_off, fallback_name, 0)
+}
+
+// decodes one lod level 0 high to 3 vlow falls back to the nearest populated level
+pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_name: &str, want_lod: usize) -> Result<Mesh3D, String> {
     let mut f = File::open(rpf_path).map_err(|e| format!("Open error: {e}"))?;
     let (v, mut next_off, p_cnt) = read_virtual_from_file(&mut f, file_off)?;
 
@@ -1126,14 +1377,9 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
     let dict = drawable_dictionary_entries(&v);
     // part name drawable offset for material lookup lod0 geometries
     type Group = (String, Option<usize>, Vec<GeomRef>);
-    let (groups, lod_label): (Vec<Group>, String) = if !dict.is_empty() {
-        let g: Vec<_> = dict
-            .iter()
-            .map(|(nm, base)| (nm.clone(), Some(*base), drawable_lod0_geoms(&v, *base)))
-            .filter(|(_, _, gs)| !gs.is_empty())
-            .collect();
-        let label = format!("LOD0 · dictionary of {}", dict.len());
-        (g, label)
+    // drawable bases that carry lod tables
+    let lod_bases: Vec<(String, usize)> = if !dict.is_empty() {
+        dict.iter().map(|(nm, base)| (nm.clone(), *base)).collect()
     } else {
         let mut bases = vec![0usize];
         if v.len() >= 0x20 {
@@ -1141,22 +1387,44 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
                 if fo + 0x80 <= v.len() { bases.push(fo); }
             }
         }
-        let lod0_with_base = bases
+        bases
             .into_iter()
-            .map(|b| (b, drawable_lod0_geoms(&v, b)))
-            .find(|(_, gs)| !gs.is_empty());
-        if let Some((b_off, lod0)) = lod0_with_base {
-            (vec![(model_name.clone(), Some(b_off), lod0)], "LOD0".into())
+            .find(|&b| (0..MAX_LODS).any(|l| !drawable_lod_geoms(&v, b, l).is_empty()))
+            .map(|b| vec![(model_name.clone(), b)])
+            .unwrap_or_default()
+    };
+    let mut lod_geoms = [0usize; MAX_LODS];
+    for (l, slot) in lod_geoms.iter_mut().enumerate() {
+        *slot = lod_bases.iter().map(|(_, b)| drawable_lod_geoms(&v, *b, l).len()).sum();
+    }
+    // requested level or the nearest populated one preferring higher detail
+    let want_lod = want_lod.min(MAX_LODS - 1);
+    let lod = (0..=want_lod)
+        .rev()
+        .chain(want_lod + 1..MAX_LODS)
+        .find(|&l| lod_geoms[l] > 0)
+        .unwrap_or(0);
+    let (groups, lod_label): (Vec<Group>, String) = if lod_geoms[lod] > 0 {
+        let g: Vec<_> = lod_bases
+            .iter()
+            .map(|(nm, base)| (nm.clone(), Some(*base), drawable_lod_geoms(&v, *base, lod)))
+            .filter(|(_, _, gs)| !gs.is_empty())
+            .collect();
+        let label = if dict.is_empty() {
+            LOD_NAMES[lod].to_string()
         } else {
-            (vec![(model_name.clone(), None, collect_all_geoms(&v))], "All".into())
-        }
+            format!("{} · dictionary of {}", LOD_NAMES[lod], dict.len())
+        };
+        (g, label)
+    } else {
+        (vec![(model_name.clone(), None, collect_all_geoms(&v))], "All".into())
     };
     let geom_count: usize = groups.iter().map(|(_, _, g)| g.len()).sum();
     if geom_count == 0 {
         return Err("No RAGE9 meshlet geometries found in resource".into());
     }
 
-    let (texture, mut tex_status) = try_extract_embedded_texture(&v, &p);
+    let (texture, tex_status) = try_extract_embedded_texture(&v, &p);
     let ttpf_idx = if texture.is_none() {
         crate::tex::ttpf_hash_index_for_rpf(rpf_path)
     } else {
@@ -1168,13 +1436,13 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
     let mut parts = Vec::with_capacity(groups.len());
     let mut part_verts = Vec::with_capacity(groups.len());
     let mut geom_materials: Vec<GeomMaterial> = Vec::with_capacity(geom_count);
-    let mut seen_hashes: HashSet<u64> = HashSet::new();
-    let mut decode_budget = 384usize;
+    let mut tex_layers: Vec<TexLayer> = Vec::new();
+    let mut layer_pos: HashMap<u64, u16> = HashMap::new();
     let mut gi_idx = 0u16;
     for (name, base_opt, geoms) in &groups {
         let mats = if texture.is_none() {
             if let Some(base) = *base_opt {
-                resolve_drawable_materials(&v, base, geoms, ttpf_idx.as_deref(), is_vehicle, &mut seen_hashes, &mut decode_budget)
+                resolve_drawable_materials(&v, base, lod, geoms, ttpf_idx.as_deref(), is_vehicle, &mut tex_layers, &mut layer_pos)
             } else {
                 vec![GeomMaterial::default(); geoms.len()]
             }
@@ -1197,17 +1465,17 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
     }
     layout_parts_in_grid(&mut b.verts, &part_verts);
 
-    let resolved_tex_geoms = geom_materials.iter().filter(|m| m.texture.is_some()).count();
-    let paint_geoms = geom_materials.iter().filter(|m| m.is_vehicle_paint).count();
-    let preview_geoms = geom_materials.iter().filter(|m| !m.auxiliary_pass).count().max(1);
-    if texture.is_none() {
-        if resolved_tex_geoms > 0 && paint_geoms > 0 {
-            tex_status = format!("TTPF: {resolved_tex_geoms}/{preview_geoms} mats + Car Paint");
-        } else if resolved_tex_geoms > 0 {
-            tex_status = format!("TTPF: {resolved_tex_geoms}/{preview_geoms} mats");
-        } else if paint_geoms > 0 {
-            tex_status = format!("Car Paint ({paint_geoms}/{preview_geoms} geoms)");
+    // default look applies the first color candidate of every drawn material
+    for m in geom_materials.iter().filter(|m| !m.auxiliary_pass) {
+        for &i in m.color_layers.iter().chain(&m.normal_layers).chain(&m.overlay_layers) {
+            tex_layers[i as usize].mats += 1;
         }
+        if let Some(&first) = m.color_layers.first() {
+            tex_layers[first as usize].default_on = true;
+        }
+    }
+    for l in &mut tex_layers {
+        l.enabled = l.default_on;
     }
 
     let mut mesh = Mesh3D::from_parts(
@@ -1224,8 +1492,11 @@ pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name
         lod_label,
     );
     mesh.geom_materials = geom_materials;
-    mesh.has_paint_geom = paint_geoms > 0;
+    mesh.tex_layers = tex_layers;
+    mesh.apply_tex_layers();
     mesh.bone_count = extract_rage9_bone_count(&v);
+    mesh.lod = lod;
+    mesh.lod_geoms = lod_geoms;
     if parts.len() > 1 {
         mesh.parts = parts;
     }
@@ -1396,6 +1667,13 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 {
                     continue;
                 }
+                // normal map and multiply overlays of the material only in textured mode without a manual texture
+                let layered = do_textured && has_uvs && mesh.texture.is_none();
+                let normal_tex: Option<&Texture2D> = if layered { gmat.and_then(|m| m.normal.as_deref()) } else { None };
+                let overlay_texs: &[Arc<Texture2D>] = match gmat {
+                    Some(m) if layered => &m.overlays,
+                    _ => &[],
+                };
                 let blend = blend_material(ti).is_some();
                 let pass = if do_textured && mesh.texture.is_some() {
                     MaterialPass::Cutout
@@ -1428,20 +1706,29 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                     continue;
                 }
 
-                let n = mesh.normals[ti];
-                let nx1 = n[0] * cy - n[1] * sy;
-                let ny1 = n[0] * sy + n[1] * cy;
-                let ny2 = -ny1 * cp + n[2] * sp;
-                let nz2 = n[2] * cp + ny1 * sp;
-
-                let ndl1 = (nx1 * l1[0] + ny2 * l1[1] + nz2 * l1[2]).abs();
-                let ndl2 = (nx1 * l2[0] + ny2 * l2[1] + nz2 * l2[2]).max(0.0);
-                let spec = ndl1.powi(10) * 0.35;
-                let rim = (1.0 - ny2.abs()).powi(2) * 0.22;
-
-                let shade_r = (0.18 + ndl1 * 0.72 + spec + rim * 0.45).min(1.15);
-                let shade_g = (0.18 + ndl1 * 0.72 + ndl2 * 0.18 + spec + rim * 0.40).min(1.15);
-                let shade_b = (0.20 + ndl1 * 0.70 + ndl2 * 0.28 + spec + rim * 0.55).min(1.15);
+                // world vector into the lighting frame
+                let to_view = |n: [f32; 3]| {
+                    let ny1 = n[0] * sy + n[1] * cy;
+                    [n[0] * cy - n[1] * sy, -ny1 * cp + n[2] * sp, n[2] * cp + ny1 * sp]
+                };
+                // rgb shade factors plus the main light term and rim used by the paint clearcoat
+                let shade_of = |nv: [f32; 3]| {
+                    let ndl1 = (nv[0] * l1[0] + nv[1] * l1[1] + nv[2] * l1[2]).abs();
+                    let ndl2 = (nv[0] * l2[0] + nv[1] * l2[1] + nv[2] * l2[2]).max(0.0);
+                    let spec = ndl1.powi(10) * 0.35;
+                    let rim = (1.0 - nv[1].abs()).powi(2) * 0.22;
+                    (
+                        [
+                            (0.18 + ndl1 * 0.72 + spec + rim * 0.45).min(1.15),
+                            (0.18 + ndl1 * 0.72 + ndl2 * 0.18 + spec + rim * 0.40).min(1.15),
+                            (0.20 + ndl1 * 0.70 + ndl2 * 0.28 + spec + rim * 0.55).min(1.15),
+                        ],
+                        ndl1,
+                        rim,
+                    )
+                };
+                let n_view = to_view(mesh.normals[ti]);
+                let ([shade_r, shade_g, shade_b], ndl1, rim) = shade_of(n_view);
 
                 let is_paint = do_textured
                     && active_tex.is_none()
@@ -1486,10 +1773,29 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 let mut w2_row = (px_start - p0[0]) * e01_dx + (py_start - p0[1]) * e01_dy;
                 let span_len = ix1 - ix0 + 1;
 
-                if let Some(tex) = active_tex {
+                if active_tex.is_some() || normal_tex.is_some() || !overlay_texs.is_empty() {
                     let uv0 = mesh.uvs[i0];
                     let uv1 = mesh.uvs[i1];
                     let uv2 = mesh.uvs[i2];
+                    // tangent frame of the triangle in the lighting frame for normal mapping
+                    let tbn = normal_tex.and_then(|_| {
+                        let (q0, q1, q2) = (mesh.verts[i0], mesh.verts[i1], mesh.verts[i2]);
+                        let e1 = [q1[0] - q0[0], q1[1] - q0[1], q1[2] - q0[2]];
+                        let e2 = [q2[0] - q0[0], q2[1] - q0[1], q2[2] - q0[2]];
+                        let (du1, dv1, du2, dv2) = (uv1[0] - uv0[0], uv1[1] - uv0[1], uv2[0] - uv0[0], uv2[1] - uv0[1]);
+                        let det = du1 * dv2 - du2 * dv1;
+                        if det.abs() < 1e-12 {
+                            return None;
+                        }
+                        let unit = |a: [f32; 3]| {
+                            let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+                            (l > 1e-12).then(|| [a[0] / l, a[1] / l, a[2] / l])
+                        };
+                        let t = unit(std::array::from_fn(|k| (e1[k] * dv2 - e2[k] * dv1) / det))?;
+                        let b = unit(std::array::from_fn(|k| (e2[k] * du1 - e1[k] * du2) / det))?;
+                        Some((to_view(t), to_view(b)))
+                    });
+                    let flat_rgb = [base_albedo[0] * 255.0, base_albedo[1] * 255.0, base_albedo[2] * 255.0];
                     for y in iy0..=iy1 {
                         let row_start = y * w + ix0;
                         let z_row = &mut mesh.z_buf[row_start..row_start + span_len];
@@ -1500,26 +1806,48 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                                 let (b0, b1, b2) = (w0 * inv_abs, w1 * inv_abs, w2 * inv_abs);
                                 let z = b0 * p0[2] + b1 * p1[2] + b2 * p2[2];
                                 if z + depth_bias > z_row[x] {
-                                    let tc = tex.sample(
-                                        b0 * uv0[0] + b1 * uv1[0] + b2 * uv2[0],
-                                        b0 * uv0[1] + b1 * uv1[1] + b2 * uv2[1],
-                                    );
-                                    let alpha = match pass {
-                                        MaterialPass::Opaque => 255,
-                                        MaterialPass::Cutout => if tc.a() >= 128 { 255 } else { 0 },
-                                        MaterialPass::Glass { texture_alpha: false } => GLASS_PREVIEW_ALPHA,
-                                        _ => tc.a(),
+                                    let u = b0 * uv0[0] + b1 * uv1[0] + b2 * uv2[0];
+                                    let v = b0 * uv0[1] + b1 * uv1[1] + b2 * uv2[1];
+                                    let tc = active_tex.map(|tex| tex.sample(u, v));
+                                    let alpha = match (pass, tc) {
+                                        (MaterialPass::Glass { .. }, None) | (MaterialPass::Glass { texture_alpha: false }, _) => GLASS_PREVIEW_ALPHA,
+                                        (MaterialPass::Opaque, _) | (_, None) => 255,
+                                        (MaterialPass::Cutout, Some(tc)) => if tc.a() >= 128 { 255 } else { 0 },
+                                        (_, Some(tc)) => tc.a(),
                                     };
                                     if alpha != 0 {
-                                        let [r, g, b, _] = if pass != MaterialPass::Opaque && tc.a() != 255 {
-                                            tc.to_srgba_unmultiplied()
-                                        } else {
-                                            tc.to_array()
+                                        let mut rgb = match tc {
+                                            Some(tc) => {
+                                                let [r, g, b, _] = if pass != MaterialPass::Opaque && tc.a() != 255 {
+                                                    tc.to_srgba_unmultiplied()
+                                                } else {
+                                                    tc.to_array()
+                                                };
+                                                [r as f32, g as f32, b as f32]
+                                            }
+                                            None => flat_rgb,
                                         };
+                                        for ov in overlay_texs {
+                                            let oc = ov.sample(u, v);
+                                            rgb[0] *= oc.r() as f32 / 255.0;
+                                            rgb[1] *= oc.g() as f32 / 255.0;
+                                            rgb[2] *= oc.b() as f32 / 255.0;
+                                        }
+                                        let (shade, ndl, rim_px) = match (normal_tex, tbn) {
+                                            (Some(nt), Some((tv, bv))) => {
+                                                let nc = nt.sample(u, v);
+                                                let (tx, ty, tz) = (nc.r() as f32 / 127.5 - 1.0, nc.g() as f32 / 127.5 - 1.0, (nc.b() as f32 / 127.5 - 1.0).max(0.05));
+                                                let nv: [f32; 3] = std::array::from_fn(|k| tv[k] * tx + bv[k] * ty + n_view[k] * tz);
+                                                let len = (nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]).sqrt().max(1e-6);
+                                                shade_of([nv[0] / len, nv[1] / len, nv[2] / len])
+                                            }
+                                            _ => ([shade_r, shade_g, shade_b], ndl1, rim),
+                                        };
+                                        let coat = if is_paint { (ndl.powi(24) * 0.55 + rim_px * 0.14) * 255.0 } else { 0.0 };
                                         let src = Color32::from_rgb(
-                                            ((r as f32 * shade_r).min(255.0)) as u8,
-                                            ((g as f32 * shade_g).min(255.0)) as u8,
-                                            ((b as f32 * shade_b).min(255.0)) as u8,
+                                            ((rgb[0] * shade[0] + coat).min(255.0)) as u8,
+                                            ((rgb[1] * shade[1] + coat).min(255.0)) as u8,
+                                            ((rgb[2] * shade[2] + coat).min(255.0)) as u8,
                                         );
                                         if blend {
                                             blend_preview_pixel(&mut c_row[x], src, alpha);
@@ -1601,6 +1929,57 @@ fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
                 }
             }
         }
+    }
+}
+
+// dropdown that switches individual material textures of the mesh on and off
+pub fn tex_layer_menu(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
+    if mesh.tex_layers.is_empty() || mesh.texture.is_some() {
+        return;
+    }
+    let on = mesh.tex_layers.iter().filter(|l| l.enabled).count();
+    let mut changed = false;
+    let mut preset: Option<fn(&TexLayer) -> bool> = None;
+    ui.menu_button(format!("Applied textures {on}/{} ⏷", mesh.tex_layers.len()), |ui| {
+        ui.set_min_width(430.0);
+        ui.horizontal(|ui| {
+            if ui.button("Default").on_hover_text("One color texture per material").clicked() { preset = Some(|l| l.default_on); }
+            if ui.button("Color + normals").clicked() { preset = Some(|l| l.default_on || l.kind == TexLayerKind::Normal); }
+            if ui.button("None").clicked() { preset = Some(|_| false); }
+        });
+        ui.label(
+            RichText::new("Color: first ticked one per material is drawn. Normal: bends the lighting. Overlay: multiplied on top.")
+                .size(10.5)
+                .color(Color32::from_rgb(150, 160, 180)),
+        );
+        ui.separator();
+        egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            for (kind, title) in [
+                (TexLayerKind::Color, "Color"),
+                (TexLayerKind::Normal, "Normal maps"),
+                (TexLayerKind::Overlay, "Overlays (dirt, dust, masks)"),
+            ] {
+                if !mesh.tex_layers.iter().any(|l| l.kind == kind) {
+                    continue;
+                }
+                ui.label(RichText::new(title).strong().size(11.5).color(Color32::from_rgb(255, 168, 28)));
+                for l in mesh.tex_layers.iter_mut().filter(|l| l.kind == kind) {
+                    let text = format!("{}  ·  {}x{}  ·  {} mat{}", l.label, l.w, l.h, l.mats, if l.mats == 1 { "" } else { "s" });
+                    let tip = format!("{}\nhash {:016x}{}", l.source, l.hash64, if l.failed { "\ncould not be decoded" } else { "" });
+                    if ui.checkbox(&mut l.enabled, text).on_hover_text(tip).changed() {
+                        changed = true;
+                    }
+                }
+                ui.add_space(4.0);
+            }
+        });
+    });
+    if let Some(f) = preset {
+        mesh.shade_mode = ShadeMode::Textured;
+        mesh.set_tex_layers(f);
+    } else if changed {
+        mesh.shade_mode = ShadeMode::Textured;
+        mesh.apply_tex_layers();
     }
 }
 
@@ -1688,6 +2067,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
                 let _ = mesh.export_obj(&p);
             }
         }
+        tex_layer_menu(ui, mesh);
         if mesh.has_paint_geom {
             ui.add_space(4.0);
             ui.label(RichText::new("Paint:").size(11.0).color(Color32::from_rgb(175, 185, 205)));
@@ -1932,6 +2312,159 @@ mod dictionary_decode_tests {
         // drawable bbox x 224m y 197m z 208m
         let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
         assert!((ext[0] - 224.2).abs() < 2.0 && (ext[1] - 197.1).abs() < 2.0 && (ext[2] - 207.7).abs() < 2.0, "extents {ext:?}");
+    }
+
+    // props keep several lod levels in one file each level decodes and detail never increases
+    #[test]
+    fn in_file_lod_levels_decode() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        let Some(root) = Path::new(&rpf).parent() else { return };
+        let pack = root.join("pack").join("shared_minigame000").join("shared_minigame000.rpf");
+        if !pack.exists() {
+            return;
+        }
+        for (tag, off, want) in [
+            ("td_resi_wall_windows_b_3", 798_629_904u64, [6usize, 6, 6, 5]),
+            ("a_td_resdoor_double_l", 800_751_632u64, [8, 8, 8, 5]),
+        ] {
+            let base = decode_rage9_model_from_rpf(&pack, off, tag).expect("decode lod0");
+            assert_eq!(base.lod, 0);
+            assert_eq!(base.lod_geoms, want, "{tag} lod table");
+            let mut prev_tris = base.tris.len();
+            for l in 1..MAX_LODS {
+                let m = decode_rage9_model_from_rpf_lod(&pack, off, tag, l).expect("decode lod");
+                eprintln!("[{tag}] {} geoms={} tris={}", m.lod_label, m.geom_count, m.tris.len());
+                assert_eq!((m.lod, m.geom_count), (l, want[l]));
+                assert!(!m.tris.is_empty() && m.tris.len() <= prev_tris, "{tag} lod{l} gained triangles");
+                prev_tris = m.tris.len();
+            }
+            assert!(prev_tris < base.tris.len(), "{tag} lowest lod should be lighter than lod0");
+        }
+    }
+
+    // vehicles split detail across _hi _mid and base files and the mid file adds a second level
+    #[test]
+    fn vehicle_detail_files_decode() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        if !Path::new(&rpf).exists() {
+            return;
+        }
+        let mut prev_tris = usize::MAX;
+        for (tag, off, want) in [
+            ("cheetah2_hi", 74_053_521_424u64, [35usize, 0, 0, 0]),
+            ("cheetah2_mid", 74_058_629_136u64, [34, 30, 0, 0]),
+            ("cheetah2", 74_051_276_816u64, [3, 0, 0, 0]),
+        ] {
+            let m = decode_rage9_model_from_rpf(Path::new(&rpf), off, tag).expect("decode vehicle");
+            assert_eq!(m.lod_geoms, want, "{tag} lod table");
+            assert!(m.tris.len() < prev_tris, "{tag} should be lighter than the file above");
+            prev_tris = m.tris.len();
+            // a missing level falls back to the nearest populated one
+            let last = want.iter().rposition(|&n| n > 0).unwrap();
+            let low = decode_rage9_model_from_rpf_lod(Path::new(&rpf), off, tag, 3).expect("fallback");
+            eprintln!("[{tag}] lod0 tris={} lowest {} tris={}", m.tris.len(), low.lod_label, low.tris.len());
+            assert_eq!(low.lod, last);
+            if last > 0 {
+                assert!(low.tris.len() < m.tris.len(), "{tag} lower level should be lighter");
+                prev_tris = low.tris.len();
+            } else {
+                assert_eq!(low.tris.len(), m.tris.len());
+            }
+        }
+    }
+
+    // texture layers start as one color texture per material and can be switched individually
+    #[test]
+    fn vehicle_texture_layers_toggle() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        if !Path::new(&rpf).exists() {
+            return;
+        }
+        let out_dir = std::env::var("PERCYSTAR_RENDER_DIR").ok();
+        let mut m = decode_rage9_model_from_rpf(Path::new(&rpf), 74_053_521_424, "cheetah2_hi").expect("decode");
+        let count = |m: &Mesh3D, k: TexLayerKind| m.tex_layers.iter().filter(|l| l.kind == k).count();
+        eprintln!(
+            "layers color={} normal={} overlay={} default_on={}",
+            count(&m, TexLayerKind::Color),
+            count(&m, TexLayerKind::Normal),
+            count(&m, TexLayerKind::Overlay),
+            m.tex_layers.iter().filter(|l| l.default_on).count()
+        );
+        assert!(count(&m, TexLayerKind::Color) > 0 && count(&m, TexLayerKind::Normal) > 0 && count(&m, TexLayerKind::Overlay) > 0);
+        assert!(m.tex_layers.iter().all(|l| l.enabled == l.default_on && l.mats > 0));
+        let textured = |m: &Mesh3D| m.geom_materials.iter().filter(|g| g.texture.is_some()).count();
+        let default_textured = textured(&m);
+        assert_eq!(default_textured, 19, "default look keeps the 19 textured materials");
+        assert!(m.geom_materials.iter().all(|g| g.normal.is_none() && g.overlays.is_empty()));
+        let mut shot = |m: &mut Mesh3D, tag: &str| {
+            rasterize_mesh(m, 800, 600);
+            if let Some(d) = &out_dir {
+                let _ = fs::create_dir_all(d);
+                let rgba: Vec<u8> = m.color_buf.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect();
+                image::save_buffer(Path::new(d).join(format!("layers_{tag}.png")), &rgba, 800, 600, image::ColorType::Rgba8).expect("save");
+            }
+            m.color_buf.clone()
+        };
+        let base = shot(&mut m, "default");
+
+        m.set_tex_layers(|l| l.default_on || l.kind == TexLayerKind::Normal);
+        assert!(m.geom_materials.iter().any(|g| g.normal.is_some()));
+        assert_eq!(textured(&m), default_textured);
+        let with_normals = shot(&mut m, "normals");
+        assert!(with_normals != base, "normal maps should change the render");
+
+        m.set_tex_layers(|l| l.default_on || l.label == "DustTexture");
+        assert!(m.geom_materials.iter().any(|g| !g.overlays.is_empty()));
+        assert!(shot(&mut m, "dust") != base, "an overlay should change the render");
+
+        m.set_tex_layers(|_| false);
+        assert_eq!(textured(&m), 0);
+        assert!(m.geom_materials.iter().all(|g| g.normal.is_none() && g.overlays.is_empty()));
+        assert!(m.has_paint_geom && m.geom_materials.iter().any(|g| g.is_vehicle_paint));
+        shot(&mut m, "none");
+
+        // one layer off only unbinds the materials that drew it
+        m.set_tex_layers(|l| l.default_on);
+        let draws = |m: &Mesh3D, li: usize| {
+            let Some(t) = m.tex_layers[li].tex.as_ref() else { return 0 };
+            m.geom_materials.iter().filter(|g| g.texture.as_ref().is_some_and(|x| Arc::ptr_eq(x, t))).count()
+        };
+        let first = (0..m.tex_layers.len()).find(|&li| draws(&m, li) > 0).expect("a drawn layer");
+        m.tex_layers[first].enabled = false;
+        m.apply_tex_layers();
+        assert_eq!(draws(&m, first), 0, "a switched off layer is no longer drawn");
+        m.set_tex_layers(|l| l.default_on);
+        assert_eq!(textured(&m), default_textured);
+        assert!(shot(&mut m, "default_again") == base, "returning to the default set reproduces the default render");
+    }
+
+    // vehicles bind their textures by hash into the ttpf pools
+    #[test]
+    fn vehicle_texture_refs_resolve() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        if !Path::new(&rpf).exists() {
+            return;
+        }
+        for (tag, off) in [("cheetah2_hi", 74_053_521_424u64), ("cheetah2_mid", 74_058_629_136u64), ("cheetah2", 74_051_276_816u64)] {
+            let refs = list_model_texture_refs(Path::new(&rpf), off).expect("list refs");
+            let hits: Vec<_> = refs.iter().filter_map(|r| r.hit.as_ref().map(|h| (r, h))).collect();
+            let bytes: usize = hits.iter().map(|(_, h)| h.w * h.h * 4).sum();
+            eprintln!("[{tag}] unique={} resolved={} rgba_mb={}", refs.len(), hits.len(), bytes >> 20);
+            if std::env::var("PERCYSTAR_TEX_DUMP").is_ok() {
+                for r in &refs {
+                    match &r.hit {
+                        Some(h) => eprintln!("   {:<24} {:016x} {}x{} dxgi{} {} #{} x{}", r.role(), r.hash64, h.w, h.h, h.dxgi, h.path.file_name().unwrap().to_string_lossy(), h.tex_idx, r.shaders),
+                        None => eprintln!("   {:<24} {:016x} unresolved x{}", r.role(), r.hash64, r.shaders),
+                    }
+                }
+            }
+            assert!(hits.len() >= 3, "{tag} should resolve textures");
+            assert!(refs.iter().any(|r| r.role() == "diffuseTex" && r.hit.is_some()), "{tag} should resolve a diffuse texture");
+            assert!(hits.iter().all(|(r, _)| r.shaders > 0 && !r.params.is_empty()));
+            let (first, hit) = hits[0];
+            let tex = crate::tex::decode_ttpf_texture(&hit.path, hit.tex_idx).expect("decode first ref");
+            assert_eq!((tex.w, tex.h), (hit.w, hit.h), "{tag} {:016x}", first.hash64);
+        }
     }
 
     // external ttpf material resolution on vehicle paint and world slod

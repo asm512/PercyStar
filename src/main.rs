@@ -15,7 +15,7 @@ mod model3d;
 mod rdna2;
 mod tex;
 use model3d::{
-    Mesh3D, decode_rage9_model_from_rpf, extract_0drpz_mesh, extract_rage9_model_name,
+    Mesh3D, decode_rage9_model_from_rpf, decode_rage9_model_from_rpf_lod, extract_0drpz_mesh, extract_rage9_model_name,
     has_rage9_meshlets, is_vehicle_virtual, is_zlib_head, parse_obj,
     probe_large_rage9_model_in_buf, render_mesh3d_viewport,
 };
@@ -484,6 +484,57 @@ enum Category {
     Binary,
 }
 
+const MODEL_TEX_TIP: &str = "Open every texture this model's materials use as flat images for inspection and export";
+
+// lod switch requested from the 3d viewer header
+#[derive(Clone, Copy)]
+enum LodPick {
+    // entry index of a sibling detail file
+    File(usize),
+    // lod slot inside the current file
+    Level(usize),
+}
+
+// file names of the three detail levels of a model stem_hi stem_mid stem ordered high to low
+fn lod_sibling_names(name: &str) -> Option<[String; 3]> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    let lower = stem.to_ascii_lowercase();
+    let cut = if lower.ends_with("_hi") { 3 } else if lower.ends_with("_mid") { 4 } else { 0 };
+    let base = &stem[..stem.len() - cut];
+    if base.is_empty() {
+        return None;
+    }
+    Some([format!("{base}_hi.{ext}"), format!("{base}_mid.{ext}"), format!("{base}.{ext}")])
+}
+
+// detail file and in file lod buttons for the viewer header returns the clicked switch
+fn lod_switch_ui(ui: &mut egui::Ui, mesh: &Mesh3D, siblings: &[(&'static str, usize)], selected: Option<usize>) -> Option<LodPick> {
+    let mut pick = None;
+    let levels = mesh.lod_geoms.iter().filter(|&&n| n > 0).count();
+    if siblings.is_empty() && levels < 2 {
+        return None;
+    }
+    ui.separator();
+    ui.label(RichText::new("Detail:").size(11.0).color(Color32::from_rgb(130, 138, 156)));
+    for &(lbl, idx) in siblings {
+        if ui.selectable_label(selected == Some(idx), lbl).on_hover_text("Separate detail level file of this model").clicked() && selected != Some(idx) {
+            pick = Some(LodPick::File(idx));
+        }
+    }
+    if levels >= 2 {
+        for (l, &n) in mesh.lod_geoms.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let tip = format!("{n} geometries stored in this file");
+            if ui.selectable_label(mesh.lod == l, model3d::LOD_NAMES[l]).on_hover_text(tip).clicked() && mesh.lod != l {
+                pick = Some(LodPick::Level(l));
+            }
+        }
+    }
+    pick
+}
+
 #[derive(Clone, Debug)]
 struct RpfEntry {
     source_rpf: PathBuf,
@@ -518,6 +569,8 @@ struct MediaState {
     bink_clip: Option<PathBuf>,
     loaded_mesh: Option<Mesh3D>,
     loaded_textures: Option<Vec<DecodedTexture>>,
+    // textures bound by the viewed model with a summary note the model stays loaded behind them
+    loaded_model_textures: Option<(Vec<DecodedTexture>, String)>,
 }
 
 #[derive(Default)]
@@ -704,6 +757,18 @@ struct Rpf9App {
     mv_cat: ModelCat,
     mv_filter: String,
     mv_hide_lods: bool,
+    // detail level files of the selected model label and entry index ordered high to low
+    lod_siblings: Vec<(&'static str, usize)>,
+    // lod switch clicked in the viewer header applied at the start of the next frame
+    lod_pick: Option<LodPick>,
+    // archive entry of the viewed model none for obj navmesh and animation previews
+    model_entry: Option<usize>,
+    // textures button clicked in the viewer header applied at the start of the next frame
+    tex_pick: bool,
+    // shown textures belong to the viewed model so the viewer offers a way back to it
+    tex_from_model: bool,
+    // camera yaw pitch zoom pan carried across a lod switch
+    lod_keep_cam: Option<[f32; 5]>,
     mv_drawer_open: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
     mv_counts: [usize; 10],
@@ -830,6 +895,12 @@ impl Rpf9App {
             mv_cat: ModelCat::All,
             mv_filter: String::new(),
             mv_hide_lods: true,
+            lod_siblings: Vec::new(),
+            lod_pick: None,
+            model_entry: None,
+            tex_pick: false,
+            tex_from_model: false,
+            lod_keep_cam: None,
             mv_drawer_open: true,
             mv_entries: Vec::new(),
             mv_counts: [0; 10],
@@ -883,6 +954,12 @@ impl Rpf9App {
 
     fn reset_selection(&mut self) {
         self.selected = None;
+        self.lod_siblings.clear();
+        self.lod_pick = None;
+        self.model_entry = None;
+        self.tex_pick = false;
+        self.tex_from_model = false;
+        self.lod_keep_cam = None;
         self.preview.clear();
         self.last_dock_rect = [0; 4];
         self.mesh3d = None;
@@ -902,6 +979,7 @@ impl Rpf9App {
         m.loading = false;
         m.loaded_mesh = None;
         m.loaded_textures = None;
+        m.loaded_model_textures = None;
     }
 
     fn browse_videos(&mut self) {
@@ -1211,36 +1289,227 @@ impl Rpf9App {
         });
     }
 
+    // other detail level files of e in the same archive stem_hi stem_mid stem
+    fn find_lod_siblings(&self, e: &RpfEntry) -> Vec<(&'static str, usize)> {
+        let Some(names) = lod_sibling_names(&e.name) else { return Vec::new() };
+        let mut found: [Option<usize>; 3] = [None; 3];
+        let st = self.state.lock().unwrap();
+        for (i, o) in st.entries.iter().enumerate() {
+            if o.kind != "MODEL" && o.kind != "VEH" {
+                continue;
+            }
+            for (k, n) in names.iter().enumerate() {
+                if found[k].is_none() && o.name.eq_ignore_ascii_case(n) && o.source_rpf == e.source_rpf {
+                    found[k] = Some(i);
+                }
+            }
+        }
+        let out: Vec<_> = ["Hi", "Mid", "Low"].into_iter().zip(found).filter_map(|(l, f)| f.map(|i| (l, i))).collect();
+        if out.len() < 2 { Vec::new() } else { out }
+    }
+
+    fn spawn_model_decode(&self, e: &RpfEntry, lod: usize) {
+        let media = Arc::clone(&self.media);
+        {
+            let mut m = media.lock().unwrap();
+            m.loading = true;
+            m.status = format!("Decoding RAGE9 meshlets: {}...", e.name);
+        }
+        let src = e.source_rpf.clone();
+        let off = e.offset;
+        let nm = e.name.clone();
+        std::thread::spawn(move || {
+            match decode_rage9_model_from_rpf_lod(&src, off, &nm, lod) {
+                Ok(mut mesh) => {
+                    // the viewer also applies normal maps unless the model binds an unusually large set
+                    let normals = mesh.tex_layers.iter().filter(|l| l.kind == model3d::TexLayerKind::Normal).count();
+                    if (1..=64).contains(&normals) {
+                        mesh.set_tex_layers(|l| l.default_on || l.kind == model3d::TexLayerKind::Normal);
+                    }
+                    let mut m = media.lock().unwrap();
+                    m.loading = false;
+                    m.status.clear();
+                    m.loaded_mesh = Some(mesh);
+                }
+                Err(err) => {
+                    let mut m = media.lock().unwrap();
+                    m.loading = false;
+                    m.status = format!("Model decode error ({nm}): {err}");
+                }
+            }
+        });
+    }
+
+    // decoded texture viewer with zoom export and a picker strip
+    fn render_texture_viewer(&mut self, ui: &mut egui::Ui) {
+        if self.tex_sel >= self.textures.len() {
+            self.tex_sel = 0;
+        }
+        let t = &self.textures[self.tex_sel];
+        let mut back = false;
+        let mut export_all = false;
+        ui.horizontal(|ui| {
+            if self.tex_from_model && ui.button("◀ Back to model").clicked() {
+                back = true;
+            }
+            ui.label(RichText::new(&t.name).strong().color(Color32::from_rgb(255, 168, 28)));
+            ui.label(RichText::new(format!("{}x{} · {} · mips={}", t.w, t.h, t.fmt_name, t.mips)).color(Color32::from_rgb(170, 210, 235)));
+            ui.add(egui::Slider::new(&mut self.tex_zoom, 0.25..=4.0).text("Zoom").fixed_decimals(2));
+            if ui.button("Export PNG").clicked() {
+                let safe: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
+                if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{safe}.png")).add_filter("PNG Image", &["png"]).save_file() {
+                    if let Err(err) = export_texture_png(t, &p) {
+                        self.state.lock().unwrap().status = err;
+                    } else {
+                        self.state.lock().unwrap().status = format!("Saved {}", p.display());
+                    }
+                }
+            }
+            if ui.button("Export DDS").clicked() {
+                let safe: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
+                if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{safe}.dds")).add_filter("DirectDraw Surface", &["dds"]).save_file() {
+                    let dds = build_dds_dx10(t.w, t.h, t.dxgi, &t.raw_dds_payload);
+                    if let Err(err) = fs::write(&p, &dds) {
+                        self.state.lock().unwrap().status = format!("DDS write error: {err}");
+                    } else {
+                        self.state.lock().unwrap().status = format!("Saved {}", p.display());
+                    }
+                }
+            }
+            if self.textures.len() > 1 && ui.button("Export All PNG").clicked() {
+                export_all = true;
+            }
+        });
+        if export_all {
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                let mut ok = 0;
+                for (i, t) in self.textures.iter().enumerate() {
+                    let safe: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
+                    if export_texture_png(t, &dir.join(format!("{i:02}_{safe}.png"))).is_ok() {
+                        ok += 1;
+                    }
+                }
+                self.state.lock().unwrap().status = format!("Saved {ok}/{} textures to {}", self.textures.len(), dir.display());
+            }
+        }
+        if back {
+            self.textures.clear();
+            self.tex_handle = None;
+            self.tex_from_model = false;
+            self.show_3d = true;
+            return;
+        }
+        if self.textures.len() > 1 {
+            ui.horizontal(|ui| {
+                if ui.button("◀").clicked() {
+                    self.tex_sel = if self.tex_sel == 0 { self.textures.len() - 1 } else { self.tex_sel - 1 };
+                }
+                ui.label(RichText::new(format!("{}/{}", self.tex_sel + 1, self.textures.len())).color(Color32::from_rgb(190, 180, 215)));
+                if ui.button("▶").clicked() {
+                    self.tex_sel = (self.tex_sel + 1) % self.textures.len();
+                }
+                egui::ScrollArea::horizontal().id_salt("txd_strip").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for (i, item) in self.textures.iter().enumerate() {
+                            if ui.selectable_label(self.tex_sel == i, format!("{} ({}x{})", item.name, item.w, item.h)).clicked() {
+                                self.tex_sel = i;
+                            }
+                        }
+                    });
+                });
+            });
+        }
+        ui.separator();
+        let need_upload = self.tex_handle.as_ref().map(|(idx, _)| *idx != self.tex_sel).unwrap_or(true);
+        if need_upload {
+            let cur = &self.textures[self.tex_sel];
+            let ci = ColorImage { size: [cur.w, cur.h], pixels: cur.pixels.clone() };
+            let h = ui.ctx().load_texture(format!("percystar_tex_{}", self.tex_sel), ci, TextureOptions::LINEAR);
+            self.tex_handle = Some((self.tex_sel, h));
+        }
+        if let Some((_, handle)) = &self.tex_handle {
+            let cur = &self.textures[self.tex_sel];
+            let avail = ui.available_size();
+            let fit = (avail.x / cur.w as f32).min(avail.y / cur.h as f32).min(1.0).max(0.05);
+            let disp = egui::vec2(cur.w as f32 * fit * self.tex_zoom, cur.h as f32 * fit * self.tex_zoom);
+            egui::ScrollArea::both().show(ui, |ui| {
+                ui.image((handle.id(), disp));
+            });
+        }
+    }
+
+    // lists and decodes every pooled texture the selected model binds in its shaders
+    fn load_model_textures(&mut self) {
+        let Some(e) = self.model_entry.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned()) else { return };
+        let media = Arc::clone(&self.media);
+        {
+            let mut m = media.lock().unwrap();
+            m.loading = true;
+            m.status = format!("Resolving textures of {}...", e.name);
+        }
+        std::thread::spawn(move || {
+            let res = model3d::list_model_texture_refs(&e.source_rpf, e.offset).and_then(|refs| {
+                let total = refs.len();
+                let pooled: Vec<_> = refs.iter().filter(|r| r.hit.is_some()).collect();
+                let mut texs = Vec::with_capacity(pooled.len());
+                for (i, r) in pooled.iter().enumerate() {
+                    media.lock().unwrap().status = format!("Decoding textures of {} ({}/{})...", e.name, i + 1, pooled.len());
+                    let Some(hit) = &r.hit else { continue };
+                    if let Ok(mut t) = decode_ttpf_texture(&hit.path, hit.tex_idx) {
+                        let pool = hit.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                        t.name = format!("{} · {pool} #{}", r.role(), hit.tex_idx);
+                        texs.push(t);
+                    }
+                }
+                if texs.is_empty() {
+                    return Err(format!("none of its {total} texture references are in the TTPF pools"));
+                }
+                let note = format!(
+                    "{}: loaded {} of {total} bound textures ({} are shared engine defaults outside the TTPF pools)",
+                    e.name,
+                    texs.len(),
+                    total - pooled.len()
+                );
+                Ok((texs, note))
+            });
+            let mut m = media.lock().unwrap();
+            m.loading = false;
+            match res {
+                Ok(v) => {
+                    m.status.clear();
+                    m.loaded_model_textures = Some(v);
+                }
+                Err(err) => m.status = format!("Model textures ({}): {err}", e.name),
+            }
+        });
+    }
+
+    // switches the viewed model to another detail file or in file lod level keeping the camera
+    fn apply_lod_pick(&mut self, pick: LodPick) {
+        let cam = self.mesh3d.as_ref().map(|m| [m.yaw, m.pitch, m.zoom, m.pan_x, m.pan_y]);
+        match pick {
+            LodPick::File(idx) => {
+                let show = self.show_3d;
+                self.select_entry(idx);
+                self.show_3d = show;
+            }
+            LodPick::Level(lod) => {
+                let Some(e) = self.selected.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned()) else { return };
+                self.spawn_model_decode(&e, lod);
+            }
+        }
+        self.lod_keep_cam = cam;
+    }
+
     fn select_entry(&mut self, idx: usize) {
         let Some(e) = self.state.lock().unwrap().entries.get(idx).cloned() else { return };
         self.reset_selection();
         self.selected = Some(idx);
 
         if e.kind == "MODEL" || e.kind == "VEH" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Decoding RAGE9 meshlets: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let off = e.offset;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_rage9_model_from_rpf(&src, off, &nm) {
-                    Ok(mesh) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status.clear();
-                        m.loaded_mesh = Some(mesh);
-                    }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("Model decode error ({nm}): {err}");
-                    }
-                }
-            });
+            self.lod_siblings = self.find_lod_siblings(&e);
+            self.model_entry = Some(idx);
+            self.spawn_model_decode(&e, 0);
             return;
         }
 
@@ -1873,6 +2142,8 @@ impl Rpf9App {
                             self.select_entry(eidx);
                         }
                     });
+                } else if self.tex_from_model && !self.textures.is_empty() {
+                    self.render_texture_viewer(ui);
                 } else if let Some(mesh) = self.mesh3d.as_mut() {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(&mesh.name).size(15.0).strong().color(Color32::from_rgb(255, 168, 28)));
@@ -1888,6 +2159,12 @@ impl Rpf9App {
                             .size(11.5)
                             .color(Color32::from_rgb(170, 200, 230)),
                         );
+                        if let Some(pick) = lod_switch_ui(ui, mesh, &self.lod_siblings, self.selected) {
+                            self.lod_pick = Some(pick);
+                        }
+                        if self.model_entry.is_some() && ui.button("Texture Browser").on_hover_text(MODEL_TEX_TIP).clicked() {
+                            self.tex_pick = true;
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Quick camera presets
                             for (lbl, yaw, pitch) in [
@@ -3591,17 +3868,39 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
 impl eframe::App for Rpf9App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_sgd5_cache();
+        if let Some(pick) = self.lod_pick.take() {
+            self.apply_lod_pick(pick);
+        }
+        if std::mem::take(&mut self.tex_pick) {
+            self.load_model_textures();
+        }
         let (media_loading, media_status) = {
             let mut m = self.media.lock().unwrap();
-            if let Some(mesh) = m.loaded_mesh.take() {
+            if let Some(mut mesh) = m.loaded_mesh.take() {
                 self.textures.clear();
                 self.tex_handle = None;
+                self.tex_from_model = false;
+                if let Some([yaw, pitch, zoom, pan_x, pan_y]) = self.lod_keep_cam.take() {
+                    (mesh.yaw, mesh.pitch, mesh.zoom, mesh.pan_x, mesh.pan_y) = (yaw, pitch, zoom, pan_x, pan_y);
+                }
+                if let Some((lbl, _)) = self.lod_siblings.iter().find(|(_, i)| Some(*i) == self.selected) {
+                    mesh.lod_label = format!("{lbl} detail file · {}", mesh.lod_label);
+                }
                 self.mesh3d = Some(mesh);
                 self.show_3d = true;
+            }
+            if let Some((texs, note)) = m.loaded_model_textures.take() {
+                self.textures = texs;
+                self.tex_sel = 0;
+                self.tex_handle = None;
+                self.tex_zoom = 1.0;
+                self.tex_from_model = true;
+                self.state.lock().unwrap().status = note;
             }
             if let Some(texs) = m.loaded_textures.take() {
                 self.mesh3d = None;
                 self.show_3d = false;
+                self.tex_from_model = false;
                 self.textures = texs;
                 self.tex_sel = 0;
                 self.tex_handle = None;
@@ -4013,73 +4312,7 @@ impl eframe::App for Rpf9App {
                         });
                 }
             } else if !self.textures.is_empty() {
-                if self.tex_sel >= self.textures.len() {
-                    self.tex_sel = 0;
-                }
-                let t = &self.textures[self.tex_sel];
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&t.name).strong().color(Color32::from_rgb(255, 168, 28)));
-                    ui.label(RichText::new(format!("{}x{} · {} · mips={}", t.w, t.h, t.fmt_name, t.mips)).color(Color32::from_rgb(170, 210, 235)));
-                    ui.add(egui::Slider::new(&mut self.tex_zoom, 0.25..=4.0).text("Zoom").fixed_decimals(2));
-                    if ui.button("Export PNG").clicked() {
-                        let safe: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
-                        if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{safe}.png")).add_filter("PNG Image", &["png"]).save_file() {
-                            if let Err(err) = export_texture_png(t, &p) {
-                                self.state.lock().unwrap().status = err;
-                            } else {
-                                self.state.lock().unwrap().status = format!("Saved {}", p.display());
-                            }
-                        }
-                    }
-                    if ui.button("Export DDS").clicked() {
-                        let safe: String = t.name.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') { c } else { '_' }).collect();
-                        if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{safe}.dds")).add_filter("DirectDraw Surface", &["dds"]).save_file() {
-                            let dds = build_dds_dx10(t.w, t.h, t.dxgi, &t.raw_dds_payload);
-                            if let Err(err) = fs::write(&p, &dds) {
-                                self.state.lock().unwrap().status = format!("DDS write error: {err}");
-                            } else {
-                                self.state.lock().unwrap().status = format!("Saved {}", p.display());
-                            }
-                        }
-                    }
-                });
-                if self.textures.len() > 1 {
-                    ui.horizontal(|ui| {
-                        if ui.button("◀").clicked() {
-                            self.tex_sel = if self.tex_sel == 0 { self.textures.len() - 1 } else { self.tex_sel - 1 };
-                        }
-                        ui.label(RichText::new(format!("{}/{}", self.tex_sel + 1, self.textures.len())).color(Color32::from_rgb(190, 180, 215)));
-                        if ui.button("▶").clicked() {
-                            self.tex_sel = (self.tex_sel + 1) % self.textures.len();
-                        }
-                        egui::ScrollArea::horizontal().id_salt("txd_strip").show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                for (i, item) in self.textures.iter().enumerate() {
-                                    if ui.selectable_label(self.tex_sel == i, format!("{} ({}x{})", item.name, item.w, item.h)).clicked() {
-                                        self.tex_sel = i;
-                                    }
-                                }
-                            });
-                        });
-                    });
-                }
-                ui.separator();
-                let need_upload = self.tex_handle.as_ref().map(|(idx, _)| *idx != self.tex_sel).unwrap_or(true);
-                if need_upload {
-                    let cur = &self.textures[self.tex_sel];
-                    let ci = ColorImage { size: [cur.w, cur.h], pixels: cur.pixels.clone() };
-                    let h = ctx.load_texture(format!("percystar_tex_{}", self.tex_sel), ci, TextureOptions::LINEAR);
-                    self.tex_handle = Some((self.tex_sel, h));
-                }
-                if let Some((_, handle)) = &self.tex_handle {
-                    let cur = &self.textures[self.tex_sel];
-                    let avail = ui.available_size();
-                    let fit = (avail.x / cur.w as f32).min(avail.y / cur.h as f32).min(1.0).max(0.05);
-                    let disp = egui::vec2(cur.w as f32 * fit * self.tex_zoom, cur.h as f32 * fit * self.tex_zoom);
-                    egui::ScrollArea::both().show(ui, |ui| {
-                        ui.image((handle.id(), disp));
-                    });
-                }
+                self.render_texture_viewer(ui);
             } else if let Some(mesh) = self.mesh3d.as_mut() {
                 let mut toggle_3d = self.show_3d;
                 ui.horizontal(|ui| {
@@ -4097,6 +4330,12 @@ impl eframe::App for Rpf9App {
                             mesh.verts = next.verts;
                             mesh.dirty = true;
                         }
+                    }
+                    if let Some(pick) = lod_switch_ui(ui, mesh, &self.lod_siblings, self.selected) {
+                        self.lod_pick = Some(pick);
+                    }
+                    if self.model_entry.is_some() && ui.button("Texture Browser").on_hover_text(MODEL_TEX_TIP).clicked() {
+                        self.tex_pick = true;
                     }
                 });
                 if self.anim_dur > 0.0 && self.anim_playing && toggle_3d {
@@ -4176,6 +4415,17 @@ impl eframe::App for Rpf9App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lod_sibling_names_cover_hi_mid_and_base() {
+        let want = ["cheetah2_hi.#ft".to_string(), "cheetah2_mid.#ft".to_string(), "cheetah2.#ft".to_string()];
+        for n in ["cheetah2.#ft", "cheetah2_hi.#ft", "cheetah2_MID.#ft"] {
+            assert_eq!(lod_sibling_names(n).unwrap(), want, "{n}");
+        }
+        assert_eq!(lod_sibling_names("a_b_bonnet_01_mid.#ft").unwrap()[2], "a_b_bonnet_01.#ft");
+        assert!(lod_sibling_names("noext").is_none());
+        assert!(lod_sibling_names("_hi.#ft").is_none());
+    }
 
     #[test]
     fn model_viewer_categories_classify_correctly() {
