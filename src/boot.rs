@@ -42,7 +42,7 @@ pub fn inspect_pe64_for_bringup(data: &[u8]) -> String {
     let rva2off = |rva: u32| -> Option<usize> {
         for (_, va, vsz, ra, _) in &secs {
             if rva >= *va && rva < va.saturating_add(*vsz) {
-                return Some((*ra + (rva - *va)) as usize);
+                return ra.checked_add(rva - *va).map(|o| o as usize);
             }
         }
         None
@@ -63,14 +63,16 @@ pub fn inspect_pe64_for_bringup(data: &[u8]) -> String {
     if imp_rva != 0 {
         if let Some(mut ioff) = rva2off(imp_rva) {
             let mut dlls = Vec::new();
-            while ioff + 20 <= data.len() {
+            // truncated or crafted images point names past the file and can list imports without end
+            while ioff + 20 <= data.len() && dlls.len() < 4096 {
                 let name_rva = rd32(data, ioff + 12);
                 if name_rva == 0 {
                     break;
                 }
-                if let Some(noff) = rva2off(name_rva) {
-                    let end = data[noff..].iter().position(|&b| b == 0).unwrap_or(0);
-                    dlls.push(String::from_utf8_lossy(&data[noff..noff + end]).into_owned());
+                if let Some(tail) = rva2off(name_rva).and_then(|noff| data.get(noff..)) {
+                    let tail = &tail[..tail.len().min(256)];
+                    let end = tail.iter().position(|&b| b == 0).unwrap_or(0);
+                    dlls.push(String::from_utf8_lossy(&tail[..end]).into_owned());
                 }
                 ioff += 20;
             }
@@ -151,6 +153,24 @@ pub fn summarize_gdk_manifest(game_cfg: &str, layout_xml: Option<&str>) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_images_do_not_panic() {
+        // every prefix of a minimal header shaped buffer and a few garbage fills
+        let mut pe = vec![0u8; 0x400];
+        pe[..2].copy_from_slice(b"MZ");
+        pe[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        for fill in [0x00u8, 0x01, 0x7f, 0xff] {
+            let mut img = pe.clone();
+            for b in &mut img[0x84..] {
+                *b = fill;
+            }
+            for len in [0x100usize, 0x101, 0x180, 0x200, 0x3ff, 0x400] {
+                let _ = inspect_pe64_for_bringup(&img[..len]);
+            }
+        }
+    }
 
     #[test]
     fn inspects_gdk_manifest_summary() {

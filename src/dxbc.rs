@@ -34,6 +34,7 @@ const IID_IDXC_RESULT: Guid = Guid::from_values(
     [0x94, 0x61, 0x6f, 0x87, 0xaf, 0x5e, 0x06, 0x59],
 );
 
+#[cfg(windows)]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Guid {
@@ -43,6 +44,7 @@ struct Guid {
     data4: [u8; 8],
 }
 
+#[cfg(windows)]
 impl Guid {
     const fn from_values(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> Self {
         Self {
@@ -73,6 +75,7 @@ pub fn disassemble(data: &[u8]) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn disassemble_with_source(data: &[u8], source: &str) -> String {
     match extract_fssm(data) {
         Ok(fssm) => format_fssm_disasm(&fssm, source),
@@ -104,8 +107,10 @@ pub fn extract_fssm(data: &[u8]) -> Result<FssmShader, String> {
             continue;
         }
 
+        // bounded inflate a shader never comes close to this
         let mut decompressed = Vec::new();
         if ZlibDecoder::new(&payload[offset..])
+            .take(64 << 20)
             .read_to_end(&mut decompressed)
             .is_err()
             || decompressed.len() < 4
@@ -248,15 +253,27 @@ fn cached_dxc_create_instance() -> Result<DxcCreateInstanceFn, String> {
 
 #[cfg(windows)]
 fn load_dxc_library() -> Result<*mut c_void, String> {
+    use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     extern "system" {
-        fn LoadLibraryA(name: *const u8) -> *mut c_void;
+        fn LoadLibraryExW(name: *const u16, file: *mut c_void, flags: u32) -> *mut c_void;
     }
-
-    let name = c"dxcompiler.dll";
-    let library = unsafe { LoadLibraryA(name.as_ptr() as *const u8) };
+    // a bare name would also search the working directory and path where a dump folder can plant a dll
+    const SEARCH_DLL_LOAD_DIR: u32 = 0x100;
+    const SEARCH_APPLICATION_DIR: u32 = 0x200;
+    const SEARCH_SYSTEM32: u32 = 0x800;
+    let load = |name: &std::ffi::OsStr, flags: u32| {
+        let wide: Vec<u16> = name.encode_wide().chain(std::iter::once(0)).collect();
+        unsafe { LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), flags) }
+    };
+    // explicit full path or the folder of the executable and system32
+    let explicit = std::env::var_os("DXCOMPILER_DLL").map(std::path::PathBuf::from).filter(|p| p.is_absolute() && p.is_file());
+    let library = match explicit {
+        Some(path) => load(path.as_os_str(), SEARCH_DLL_LOAD_DIR | SEARCH_SYSTEM32),
+        None => load(std::ffi::OsStr::new("dxcompiler.dll"), SEARCH_APPLICATION_DIR | SEARCH_SYSTEM32),
+    };
     if library.is_null() {
-        return Err("dxcompiler.dll was not found".into());
+        return Err("dxcompiler.dll was not found next to PercyStar.exe (or set DXCOMPILER_DLL to its full path)".into());
     }
     Ok(library)
 }
@@ -268,11 +285,11 @@ fn get_dxc_create_instance(
 {
     #[link(name = "kernel32")]
     extern "system" {
-        fn GetProcAddress(library: *mut c_void, name: *const u8) -> *mut c_void;
+        fn GetProcAddress(library: isize, name: *const u8) -> *const c_void;
     }
 
     let name = c"DxcCreateInstance";
-    let address = unsafe { GetProcAddress(library, name.as_ptr() as *const u8) };
+    let address = unsafe { GetProcAddress(library as isize, name.as_ptr() as *const u8) };
     if address.is_null() {
         return Err("dxcompiler.dll does not export DxcCreateInstance".into());
     }

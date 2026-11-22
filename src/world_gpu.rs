@@ -13,7 +13,10 @@ use winit::dpi::PhysicalPosition;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Icon, Window, WindowId};
+
+mod smoke;
+pub use smoke::run_gpu_world_smoke;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -57,7 +60,7 @@ struct FrameUniforms {
     sky_horizon: [f32; 4],
     flags: [f32; 4], // x=rt_on, y=time_hours, z=map_min_x, w=map_span_x
     map_y: [f32; 4], // x=map_min_y, y=map_span_y, z=viewport_w, w=viewport_h
-    hud: [f32; 4],   // x=load_progress, y=loading_active, z=elapsed_sec, w=sgd5_count
+    hud: [f32; 4],   // x=load_progress, y=loading_active, z=elapsed_sec, w=fog_density
 }
 
 pub struct WorldBatchInput {
@@ -78,10 +81,13 @@ pub enum WorldStreamMsg {
     MapCount(usize),
     TotalArchetypes(usize),
     ArchetypeDone,
-    Sgd5Count(usize),
 }
 
-pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -> Result<(), String> {
+pub fn launch_world_gpu_process(
+    common_rpf: Option<&Path>,
+    levels_rpf: Option<&Path>,
+    ctx: eframe::egui::Context,
+) -> Result<Receiver<Result<(), String>>, String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--gpu-world");
@@ -91,11 +97,53 @@ pub fn launch_world_gpu_process(common_rpf: Option<&Path>, levels_rpf: Option<&P
     if let Some(l) = levels_rpf {
         cmd.arg("--levels").arg(l);
     }
-    cmd.spawn().map_err(|e| format!("Failed to launch 3D GPU World: {e}"))?;
-    Ok(())
+    use std::process::Stdio;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to launch 3D GPU World: {e}"))?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Read};
+        let stderr = child.stderr.take().unwrap();
+        let errors = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut text);
+            text
+        });
+        let mut ready = false;
+        for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+            match line {
+                Ok(line) if line == "WORLD_READY" => {
+                    ready = true;
+                    let _ = tx.send(Ok(()));
+                    ctx.request_repaint();
+                }
+                Ok(line) if line.starts_with("WORLD_ERROR ") => {
+                    let _ = tx.send(Err(line[12..].to_string()));
+                    ctx.request_repaint();
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(format!("GPU viewer output failed: {error}")));
+                    ctx.request_repaint();
+                }
+                _ => {}
+            }
+        }
+        let status = child.wait();
+        let errors = errors.join().unwrap_or_default();
+        if !ready || status.as_ref().map_or(true, |s| !s.success()) {
+            let _ = tx.send(Err(format!("GPU viewer exited ({status:?}): {}", errors.trim())));
+            ctx.request_repaint();
+        }
+    });
+    Ok(rx)
 }
 
-pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
+pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -> Result<(), String> {
     #[cfg(windows)]
     unsafe {
         extern "system" {
@@ -112,10 +160,11 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
     let resolved_levels = levels_rpf.map(Path::to_path_buf).or_else(|| {
         fallback_dir.as_ref().map(|d| d.join("levels.rpf")).filter(|p| p.exists())
     });
-    let terrain = resolved_common
-        .as_deref()
-        .and_then(|p| crate::worldmap::load_mhiu_from_rpf(p).ok())
-        .map(Arc::new);
+    if resolved_common.is_none() && resolved_levels.is_none() {
+        return Err("No world archives found; open a game folder first".into());
+    }
+    let terrain = resolved_common.as_deref()
+        .map(|p| crate::worldmap::load_mhiu_from_rpf(p).map(Arc::new)).transpose()?;
     let cfg = WorldLaunchConfig {
         terrain,
         batches: Vec::new(),
@@ -123,9 +172,7 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
         map_count: 0,
         start_pos: [-127.276, -1855.924, 24.0],
     };
-    let Ok(event_loop) = EventLoop::builder().build() else {
-        return;
-    };
+    let event_loop = EventLoop::builder().build().map_err(|e| format!("Cannot start GPU event loop: {e}"))?;
     let (tx, rx) = mpsc::sync_channel(16);
     let cam_track = Arc::new(std::sync::Mutex::new((Vec3::from_array(cfg.start_pos), 1u64)));
     let cam_track_bg = Arc::clone(&cam_track);
@@ -249,11 +296,10 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
                             let (h, moff, ref insts) = groups[i];
                             if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
                                 let lo = mesh.name.to_ascii_lowercase();
-                                if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy")) {
-                                    if tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
+                                if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy"))
+                                    && tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
                                         break;
                                     }
-                                }
                             }
                             if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
                                 break;
@@ -266,7 +312,8 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) {
         });
     }
     let mut app = GpuWorldApp::new(cfg, rx, cam_track);
-    let _ = event_loop.run_app(&mut app);
+    event_loop.run_app(&mut app).map_err(|e| format!("GPU event loop failed: {e}"))?;
+    match app.failure { Some(error) => Err(error), None => Ok(()) }
 }
 
 const WORLD_WGSL: &str = r#"
@@ -564,6 +611,7 @@ struct GpuMeshBatch {
     ib: wgpu::Buffer,
     inst_buf: wgpu::Buffer,
     index_count: u32,
+    index_format: wgpu::IndexFormat,
     inst_count: u32,
     tex_bind_group: wgpu::BindGroup,
     bound_center: Vec3,
@@ -579,6 +627,7 @@ struct GpuState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     depth_view: wgpu::TextureView,
+    depth_texture: wgpu::Texture,
     shadow_view: wgpu::TextureView,
     uniform_buf: wgpu::Buffer,
     uniform_bg: wgpu::BindGroup,
@@ -601,7 +650,6 @@ struct GpuState {
     map_count: usize,
     stream_done: usize,
     stream_total: usize,
-    sgd5_count: usize,
     tex_bytes: usize,
     geom_bytes: usize,
     vram_oom: bool,
@@ -612,18 +660,18 @@ struct GpuState {
     map_span: [f32; 2],
 }
 
-fn create_depth_view(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
+fn create_depth_texture(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
+    
+    device.create_texture(&wgpu::TextureDescriptor {
         label: Some("world_depth"),
         size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
-    });
-    tex.create_view(&wgpu::TextureViewDescriptor::default())
+    })
 }
 
 fn upload_texture(
@@ -747,7 +795,8 @@ impl GpuState {
         };
         surface.configure(&device, &config);
 
-        let depth_view = create_depth_view(&device, config.width, config.height);
+        let depth_texture = create_depth_texture(&device, config.width, config.height);
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let shadow_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("sun_shadow_map"),
             size: wgpu::Extent3d { width: 2048, height: 2048, depth_or_array_layers: 1 },
@@ -1002,7 +1051,7 @@ impl GpuState {
             cache: None,
         });
 
-        let white_tex = Texture2D { w: 1, h: 1, pixels: vec![eframe::egui::Color32::from_rgb(190, 195, 205)] };
+        let white_tex = Texture2D::new(1, 1, vec![eframe::egui::Color32::from_rgb(190, 195, 205)]);
         let (white_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
         let (minimap_bg, _) = upload_texture(&device, &queue, &tex_bgl, &tex_samp, &white_tex, 256);
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
@@ -1014,6 +1063,7 @@ impl GpuState {
             queue,
             config,
             depth_view,
+            depth_texture,
             shadow_view,
             uniform_buf,
             uniform_bg,
@@ -1036,7 +1086,6 @@ impl GpuState {
             map_count: cfg.map_count,
             stream_done: 0,
             stream_total: 0,
-            sgd5_count: 0,
             tex_bytes: 0,
             geom_bytes: 0,
             vram_oom: false,
@@ -1050,12 +1099,17 @@ impl GpuState {
         if let Some(ref terrain) = cfg.terrain {
             st.map_min = [terrain.bmin[0], terrain.bmin[1]];
             st.map_span = [terrain.bmax[0] - terrain.bmin[0], terrain.bmax[1] - terrain.bmin[1]];
-            let tmesh = terrain.build_terrain_mesh(8);
+            let tmesh = terrain.build_world_terrain_mesh(8);
             if let Some(ref t) = tmesh.texture {
                 let (mbg, bytes) = upload_texture(&st.device, &st.queue, &st.tex_bgl, &st.tex_samp, t, 1024);
                 st.minimap_bg = mbg;
                 st.tex_bytes += bytes;
             }
+            st.add_batch(&WorldBatchInput {
+                mesh: tmesh,
+                instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
+            });
+            st.model_count = st.model_count.saturating_sub(1);
         }
 
         for b in &cfg.batches {
@@ -1071,8 +1125,10 @@ impl GpuState {
         }
         const MAX_GEOM_BYTES: usize = 1024 * 1024 * 1024;
         let is_terrain = b.mesh.name == "mhiu_world_terrain";
+        let use_u16 = b.mesh.verts.len() <= u16::MAX as usize;
+        let idx_fmt = if use_u16 { wgpu::IndexFormat::Uint16 } else { wgpu::IndexFormat::Uint32 };
         let est_geom_bytes = b.mesh.verts.len() * std::mem::size_of::<GpuVertex>()
-            + b.mesh.tris.len() * 12
+            + b.mesh.tris.len() * if use_u16 { 6 } else { 12 }
             + b.instances.len() * std::mem::size_of::<GpuInstance>();
         if !is_terrain && (self.vram_oom || self.geom_bytes.saturating_add(est_geom_bytes) > MAX_GEOM_BYTES) {
             return;
@@ -1119,11 +1175,20 @@ impl GpuState {
         });
         let mut ibs = Vec::with_capacity(by_geom.len());
         for (g, indices) in by_geom {
-            let ib = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("m_ib"),
-                contents: bytemuck::cast_slice(&indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+            let ib = if use_u16 {
+                let idx16: Vec<u16> = indices.iter().map(|&i| i as u16).collect();
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("m_ib16"),
+                    contents: bytemuck::cast_slice(&idx16),
+                    usage: wgpu::BufferUsages::INDEX,
+                })
+            } else {
+                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("m_ib32"),
+                    contents: bytemuck::cast_slice(&indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                })
+            };
             ibs.push((g, indices.len() as u32, ib));
         }
         if let Some(err) = pollster_block_on(self.device.pop_error_scope()) {
@@ -1177,6 +1242,7 @@ impl GpuState {
                 ib,
                 inst_buf: inst_buf.clone(),
                 index_count,
+                index_format: idx_fmt,
                 inst_count: insts.len() as u32,
                 tex_bind_group: tex_bg,
                 bound_center,
@@ -1199,7 +1265,8 @@ impl GpuState {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        self.depth_view = create_depth_view(&self.device, w, h);
+        self.depth_texture = create_depth_texture(&self.device, w, h);
+        self.depth_view = self.depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
     }
 }
 
@@ -1226,11 +1293,14 @@ struct GpuWorldApp {
     show_boxes: bool,
     fog_density: f32,
     exposure: f32,
-    keys: [bool; 8], // W A S D Q E Shift Space
+    keys: [bool; 9], // W A S D Q E Shift Space Ctrl
     dragging: bool,
     last_cursor: Option<PhysicalPosition<f64>>,
     last_frame: Instant,
     last_title: Instant,
+    smoke_frames: Option<u32>,
+    ready: bool,
+    failure: Option<String>,
 }
 
 impl GpuWorldApp {
@@ -1258,18 +1328,21 @@ impl GpuWorldApp {
             show_boxes: false,
             fog_density: 0.70,
             exposure: 1.0,
-            keys: [false; 8],
+            keys: [false; 9],
             dragging: false,
             last_cursor: None,
             last_frame: Instant::now(),
             last_title: Instant::now(),
+            smoke_frames: None,
+            ready: false,
+            failure: None,
         }
     }
 
     fn sample_terrain_z(&self, x: f32, y: f32) -> f32 {
         let Some(ref t) = self.terrain_ref else { return 0.0 };
         let u = ((x - t.bmin[0]) / (t.bmax[0] - t.bmin[0]).max(1.0)).clamp(0.0, 1.0);
-        let v = ((y - t.bmin[1]) / (t.bmax[1] - t.bmin[1]).max(1.0)).clamp(0.0, 1.0);
+        let v = (1.0 - (y - t.bmin[1]) / (t.bmax[1] - t.bmin[1]).max(1.0)).clamp(0.0, 1.0);
         let ix = ((u * (t.w.saturating_sub(1)) as f32) as usize).min(t.w - 1);
         let iy = ((v * (t.h.saturating_sub(1)) as f32) as usize).min(t.h - 1);
         let h = t.heights[iy * t.w + ix] as f32 / 255.0;
@@ -1282,11 +1355,27 @@ impl ApplicationHandler for GpuWorldApp {
         if self.gpu.is_some() {
             return;
         }
+        let icon = image::load_from_memory(include_bytes!("../assets/logo.png")).ok().and_then(|image| {
+                let image = image.into_rgba8();
+                let (w, h) = image.dimensions();
+                Icon::from_rgba(image.into_raw(), w, h).ok()
+            });
         let attrs = Window::default_attributes()
             .with_title("PercyStar 3D World (wgpu)")
+            .with_window_icon(icon.clone())
             .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 860.0));
-        let Ok(win) = event_loop.create_window(attrs) else {
-            return;
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_taskbar_icon(icon)
+        };
+        let win = match event_loop.create_window(attrs) {
+            Ok(win) => win,
+            Err(error) => {
+                self.failure = Some(format!("Could not create GPU World window: {error}"));
+                event_loop.exit();
+                return;
+            }
         };
         let win = Arc::new(win);
         let cfg = self.cfg.take().unwrap_or(WorldLaunchConfig {
@@ -1297,6 +1386,7 @@ impl ApplicationHandler for GpuWorldApp {
             start_pos: [0.0, 0.0, 120.0],
         });
         self.gpu = Some(GpuState::new(win, &cfg));
+        self.gpu.as_ref().unwrap().window.request_redraw();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1368,6 +1458,7 @@ impl ApplicationHandler for GpuWorldApp {
                         KeyCode::KeyE => self.keys[5] = down,
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys[6] = down,
                         KeyCode::Space => self.keys[7] = down,
+                        KeyCode::ControlLeft | KeyCode::ControlRight => self.keys[8] = down,
                         KeyCode::Home | KeyCode::F1 if down => self.menu_open = !self.menu_open,
                         KeyCode::KeyB if down => self.show_boxes = !self.show_boxes,
                         KeyCode::F6 if down => self.auto_sun = !self.auto_sun,
@@ -1388,14 +1479,17 @@ impl ApplicationHandler for GpuWorldApp {
                 self.last_frame = now;
 
                 if let Some(g) = &mut self.gpu {
-                    for _ in 0..2 {
+                    let upload_start = Instant::now();
+                    for _ in 0..8 {
+                        if upload_start.elapsed().as_micros() >= 6000 {
+                            break;
+                        }
                         let Ok(msg) = self.stream_rx.try_recv() else { break };
                         match msg {
                             WorldStreamMsg::Batch(batch) => g.add_batch(&batch),
                             WorldStreamMsg::MapCount(mc) => g.map_count = mc,
                             WorldStreamMsg::TotalArchetypes(t) => g.stream_total = t,
                             WorldStreamMsg::ArchetypeDone => g.stream_done += 1,
-                            WorldStreamMsg::Sgd5Count(n) => g.sgd5_count = n,
                         }
                     }
                 }
@@ -1408,9 +1502,11 @@ impl ApplicationHandler for GpuWorldApp {
                 let right = fwd.cross(Vec3::Z).normalize_or(Vec3::Y);
                 let move_fwd = if self.walk_mode { fwd_flat } else { fwd };
                 let speed = if self.walk_mode {
-                    if self.keys[6] { 45.0 } else { 14.0 }
+                    if self.keys[6] { 45.0 } else if self.keys[8] { 4.0 } else { 14.0 }
                 } else if self.keys[6] {
                     650.0
+                } else if self.keys[8] {
+                    28.0
                 } else {
                     140.0
                 } * dt;
@@ -1455,13 +1551,12 @@ impl ApplicationHandler for GpuWorldApp {
                     } else {
                         " | Indexing...".to_string()
                     };
-                    let sgd_lbl = if g.sgd5_count > 0 { format!(" | SGD5: {}", g.sgd5_count) } else { String::new() };
                     g.window.set_title(&format!(
-                        "PercyStar 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | RT: {}{}{}",
+                        "PercyStar 3D World | pos {:.0} {:.0} {:.0} | {} | Sun az {:.1} el {:+.1} (F6) | Time {:.2}h | {} maps | {} models | {} instances | {:.2} M tris | RT: {}{}",
                         self.cam_pos.x, self.cam_pos.y, self.cam_pos.z, mode_lbl,
                         az.to_degrees().rem_euclid(360.0), el.to_degrees(),
                         self.time_h, g.map_count, g.model_count, g.instance_count,
-                        g.tri_count as f64 / 1e6, rt_lbl, load_lbl, sgd_lbl
+                        g.tri_count as f64 / 1e6, rt_lbl, load_lbl
                     ));
                 }
 
@@ -1524,7 +1619,7 @@ impl ApplicationHandler for GpuWorldApp {
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
-                        rp.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.set_index_buffer(b.ib.slice(..), b.index_format);
                         rp.draw_indexed(0..b.index_count, 0, 0..b.inst_count);
                     }
                 }
@@ -1551,8 +1646,11 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_bind_group(2, &g.shadow_bg, &[]);
                     rp.draw(0..3, 0..1);
 
-                    rp.set_pipeline(&g.water_pipeline);
-                    rp.draw(0..6, 0..1);
+                    // Smoke checks must not mistake the ocean plane for loaded geometry.
+                    if self.smoke_frames.is_none() {
+                        rp.set_pipeline(&g.water_pipeline);
+                        rp.draw(0..6, 0..1);
+                    }
 
                     rp.set_pipeline(&g.main_pipeline);
                     let mut drawn = 0usize;
@@ -1581,7 +1679,7 @@ impl ApplicationHandler for GpuWorldApp {
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
-                        rp.set_index_buffer(b.ib.slice(..), wgpu::IndexFormat::Uint32);
+                        rp.set_index_buffer(b.ib.slice(..), b.index_format);
                         rp.draw_indexed(0..b.index_count, 0, 0..b.inst_count);
                     }
 
@@ -1611,7 +1709,7 @@ impl ApplicationHandler for GpuWorldApp {
                         let mut vis = eframe::egui::Visuals::dark();
                         vis.window_fill = eframe::egui::Color32::from_rgba_premultiplied(20, 13, 31, 238);
                         vis.panel_fill = eframe::egui::Color32::from_rgb(20, 13, 31);
-                        vis.window_stroke = eframe::egui::Stroke::new(1.2, eframe::egui::Color32::from_rgb(255, 72, 165));
+                        vis.window_stroke = eframe::egui::Stroke::new(1.2_f32, eframe::egui::Color32::from_rgb(255, 72, 165));
                         vis.widgets.inactive.bg_fill = eframe::egui::Color32::from_rgb(36, 22, 54);
                         vis.widgets.hovered.bg_fill = eframe::egui::Color32::from_rgb(56, 32, 82);
                         vis.widgets.active.bg_fill = eframe::egui::Color32::from_rgb(255, 168, 28);
@@ -1697,6 +1795,21 @@ impl ApplicationHandler for GpuWorldApp {
 
                 g.queue.submit(Some(enc.finish()));
                 frame.present();
+                if !self.ready {
+                    use std::io::Write;
+                    println!("WORLD_READY");
+                    let _ = std::io::stdout().flush();
+                    self.ready = true;
+                }
+                if let Some(frames) = &mut self.smoke_frames {
+                    if !g.batches.is_empty() {
+                        *frames -= 1;
+                        if *frames == 0 {
+                            g.assert_visible_geometry();
+                            event_loop.exit();
+                        }
+                    }
+                }
                 g.window.request_redraw();
             }
             _ => {}
@@ -1720,5 +1833,44 @@ fn pollster_block_on<F: std::future::Future>(fut: F) -> F::Output {
             return res;
         }
         std::thread::yield_now();
+    }
+}
+
+#[cfg(test)]
+mod terrain_sampling_tests {
+    use super::*;
+    #[test]
+    fn camera_keeps_configured_start_and_samples_north_to_south() {
+        let cfg = WorldLaunchConfig {
+            terrain: Some(Arc::new(WorldMapData {
+                w: 2,
+                h: 2,
+                bmin: [-10.0, -10.0, 0.0],
+                bmax: [10.0, 10.0, 255.0],
+                heights: vec![10, 10, 200, 200],
+                tex: None,
+            })),
+            batches: vec![],
+            levels_rpf: None,
+            map_count: 1,
+            start_pos: [-127.276, -1855.924, 24.0],
+        };
+        let (_, rx) = mpsc::sync_channel(16);
+        let start = Vec3::from_array(cfg.start_pos);
+        let app = GpuWorldApp::new(cfg, rx, Arc::new(std::sync::Mutex::new((start, 1))));
+        assert_eq!(app.cam_pos, start);
+        assert!((app.sample_terrain_z(0.0, 10.0) - 10.0).abs() < 0.001);
+        assert!((app.sample_terrain_z(0.0, -10.0) - 200.0).abs() < 0.001);
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    #[test]
+    fn missing_world_archive_reports_an_error() {
+        let missing = Path::new("target/missing-world-regression.rpf");
+        assert!(!missing.exists());
+        assert!(run_gpu_world_cli(Some(missing), None).is_err());
     }
 }

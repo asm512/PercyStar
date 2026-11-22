@@ -9,8 +9,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.3.8-FFA81C?style=flat-square" alt="Version" />
-  <img src="https://img.shields.io/badge/Rust-1.85%2B-orange?style=flat-square&logo=rust" alt="Rust" />
+  <img src="https://img.shields.io/badge/Version-v1.4.7-FFA81C?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Rust-1.89%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Shaders-RDNA2%20GFX10.3%20%E2%86%92%20HLSL%20%2F%20SPIR--V-FF4FA3?style=flat-square" alt="Shaders" />
   <img src="https://img.shields.io/badge/Textures-100%25%20DXGI%20%2B%20RDNA2%204KB%2F64KB-48D2FF?style=flat-square" alt="Textures" />
   <img src="https://img.shields.io/badge/3D-Model%20Viewer%20(10%20Categories)-FF55AF?style=flat-square" alt="3D" />
@@ -21,8 +21,8 @@
 </p>
 
 <p align="center">
-  <strong>Latest Release: <a href="https://github.com/rpatty-dev/PercyStar/releases/latest">Download PercyStar v1.3.8 (Win64 + In-App Auto-Updater)</a></strong> · <strong><a href="https://github.com/rpatty-dev/PercyStar/releases/download/v1.0.3/PercyStar_macOS.zip">macOS Universal Build</a></strong><br />
-  <strong>Live Research &amp; Breakthroughs Dashboard: <a href="https://percystar-breakthroughs.vercel.app">percystar-breakthroughs.vercel.app</a></strong> · <strong><a href="https://mapnavmeshsite.vercel.app">Interactive NavMesh World Map</a></strong><br />
+  <strong>Latest Release: <a href="https://github.com/rpatty-dev/PercyStar/releases/latest">Download PercyStar v1.4.7 (Win64 + In-App Auto-Updater)</a></strong> · <strong><a href="https://github.com/rpatty-dev/PercyStar/releases/download/v1.0.3/PercyStar_macOS.zip">macOS Universal Build</a></strong><br />
+  <strong>Companion Scarlett Layer: <a href="https://rpatty-dev.github.io/PercyScarlett/">PercyScarlett (100% SM 6.6 DXIL Proof)</a></strong> · <strong><a href="https://percystar-breakthroughs.vercel.app">Breakthroughs Dashboard</a></strong> · <strong><a href="https://mapnavmeshsite.vercel.app">NavMesh World Map</a></strong><br />
   <sub>Windows users on v1.0.3+ can click the golden <b>★ Update Available</b> pill inside PercyStar for 1-click self-update.</sub>
 </p>
 
@@ -61,6 +61,29 @@
 </details>
 
 ---
+
+## What's New (v1.4.7)
+
+- **Code Health Pass**
+  - Text-file readers (`lines()` in `src/main.rs`) now stop on an I/O error instead of retrying forever on a failing read.
+  - Removed dead code: unused `play_wav_async` (Windows + Unix), unused `parse_sgd5`, and the never-sent `Sgd5Count` world-stream message and its empty title-bar label.
+  - Applied mechanical lint cleanups across 13 modules (`div_ceil`, `is_multiple_of`, `as_chunks`, range checks, simplified `map_or`), with no behaviour change.
+  - Test module in `src/main.rs` moved to the end of the file.
+- **Explorer Marquee Scroll Lock (#41, `src/main.rs`)**: Locks vertical scrolling on the Explorer list while a marquee drag selection is active (`Escape` or pointer release restores scrolling immediately).
+- **Verified Test Suite**: `96 passed; 0 failed` (`cargo test`).
+
+## Model Viewer & Export Quality
+
+- **Smooth-Shaded, Filtered, Anti-Aliased Model Viewer (`src/model3d/raster.rs`, `shading.rs`, `texture.rs`)**
+  - Shading normals rebuilt from topology: faces that share a GPU vertex smooth together, vertices duplicated at one position (UV seams, per-geometry quantization) are welded within a tolerance, and hard edges stay hard. A **Smooth** toggle shows the real facets.
+  - Trilinear texture filtering over a linear-light mip chain, perspective-correct UVs/normals/depth, per-pixel lighting in linear light with tangent-space normal maps, a clearcoat for vehicle paint, and straight-alpha textures so an alpha channel that carries data never darkens the color.
+  - Watertight fixed-point rasterizer (top-left fill rule, no pinholes in dense meshes, no double blending on glass), rendered on all CPU cores, supersampled when the camera rests and adaptive resolution while it moves.
+- **Export With Normals, Materials & Textures (`src/model3d/export.rs`)**
+  - **Export .OBJ** writes shared `vn` normals, bottom-left `vt`, a `.mtl` library and the applied textures as PNG. **Export .GLB** writes binary glTF 2.0 (Y-up, one node per drawable, embedded PNG textures, `MASK`/`BLEND` alpha modes) that opens directly in Blender and game engines.
+- **Open From the Command Line or by Drag & Drop (`src/main.rs`)**
+  - `PercyStar <path>` ("Open with", or dragging a file onto the exe) and dropping a file or folder onto the window open a game folder, an `.rpf`/`.ttpf` archive, an `.obj` model or a `.ps09` cache directly.
+- **Texture Decoder Fixes (`src/tex.rs`)**
+  - `BC2`/`BC3` color blocks are always decoded four-color, `BC4_SNORM`/`BC5_SNORM` are decoded signed, and single-channel `BC4` masks are no longer bound as normal maps.
 
 ## Features & Format Breakthroughs (v1.3.8)
 
@@ -169,7 +192,13 @@ PercyStar/
 │   ├── dat.rs              # RAGE 9 audio metadata (DAT25/26/41/61) decoder
 │   ├── rsc9.rs             # RSC9 0x71717171 table & phBound AABB inspector
 │   ├── boot.rs             # PE64 bring-up & manifest inspector (--inspect-exe) 😉
-│   ├── model3d.rs          # RAGE 9 meshlet decoder, UV/TXD parser & Z-buffer renderer
+│   ├── model3d.rs          # RAGE 9 meshlet decoder, UV/TXD parser & model viewer UI
+│   ├── model3d/
+│   │   ├── vertex_stream.rs # Packed / float3 vertex-stream decoder
+│   │   ├── shading.rs      # Smooth shading normals rebuilt from topology
+│   │   ├── texture.rs      # Straight-alpha textures, mip chain & trilinear sampler
+│   │   ├── raster.rs       # Multithreaded software renderer (visibility buffer, supersampling)
+│   │   └── export.rs       # OBJ + MTL and binary glTF (.glb) exporters
 │   ├── tex.rs              # Console RDNA2 4KB/64KB textures, TTPF, RBF0, GFx, 0DRPz & CNavMesh
 │   └── awc.rs              # Pure-Rust ADAT (.awc) Opus -> .wav decoder
 ├── app.rc / build.rs       # Win32 icon resource
@@ -181,28 +210,35 @@ PercyStar/
 
 ## Building from Source
 
-Requires **Rust** (`x86_64-pc-windows-gnu` with MinGW `windres`/`dlltool`, or `msvc`). Cargo fetches all pinned dependencies from `Cargo.lock`:
+Requires **Rust 1.89 or newer** (`x86_64-pc-windows-gnu` with MinGW `windres`/`dlltool`, or `msvc`). Cargo fetches all pinned dependencies from `Cargo.lock`:
+
+```powershell
+cargo test
+cargo build --release
+```
+
+Compiled standalone binary: `target/release/PercyStar.exe`. `scripts/build_linux.sh` and `scripts/build_macos.sh` package the other platforms. Every push and pull request is built and tested by [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+Optional external tools are only loaded from trusted locations: `binkplay.exe` next to `PercyStar.exe`, on `PATH`, in the RAD install folders or from `BINKPLAY_PATH`; `dxcompiler.dll` next to `PercyStar.exe`, in `System32` or from `DXCOMPILER_DLL`; `bink2w64.dll` next to `PercyStar.exe` or from `BINK2_DLL`. They are never picked up from the working directory or from the folder of an opened file.
 
 ---
 
 ## Credits & Community
 
-- **Original Creator**: `@rpatty-dev` (`@rpatty`)
-- **Contributors**:
-  - `@Ahmet-Dedeler` ([Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars)) — macOS build & 3D viewer PRs (#6, #7), `RADTools.exe` installer fix, mip0/mip1 placement insight, cutout/glass/decal blending, shadow-proxy hiding, and Videos/OBJ/PS09 UX improvements.
-  - `@GamingChelsea` (PR #10) — AWC decode diagnostics, 512 KB superblock stream splitting, and waveform audio player foundation (upgraded with zero-copy ring buffers, smooth drag scrubbing, stream filter, Loop/Auto-Next, WAV export, and keyboard shortcuts).
-  - `@kotelkonrad` (Issue #11) — suggested arrow-key / WASD asset browsing navigation.
-  - `@techfoundrynz` (PRs #12, #13) — 40-bit/21-bit `>4 GiB` TTPF texture addressing and format 99 `float3` meshlet vertex-stream decoder.
-  - `@paryzius` ([ttpf-viewer](https://github.com/paryzius/ttpf-viewer)) — `.ttpf` reduced-mip fallback when mip 0 sits in unreadable BCPack/truncated chunks.
-  - `@holdmysocks` ([SixNG](https://github.com/holdmysocks/SixNG)) — `0DRPz` (`0x7a`) map placement schema (`0xd3593fa6` / `0xce501483`) for world entity streaming.
-  - `@Xyzstk` — `SGD5` & `DXBC`/`FSSM` RDNA2 shader PR (#8).
-
-```powershell
-cargo test --release
-cargo build --release
-```
-
-Compiled standalone binary: `target/release/PercyStar.exe`.
+- **Original Creator:** [@rpatty-dev](https://github.com/rpatty-dev) (`@rpatty`)
+- **Code & Research Contributors:**
+  - [@Pokeralho](https://github.com/Pokeralho) (`Luis F.`, PR #42) — Smooth-shaded trilinear visibility-buffer 3D model renderer (`raster.rs`, `shading.rs`, `texture.rs`), OBJ+MTL+PNG & binary glTF 2.0 (`.glb`) export (`export.rs`), straight-alpha & BC2/BC3/BC4/BC5 decoder fixes, CLI/drag-and-drop path opening, Linux build fix, parser/updater security hardening, and headless viewport/siren tests.
+  - [@clayeon](https://github.com/clayeon) (PR #34) — Emergency lights with siren sequencer timing, modular fragment/roofbar composition, and `packs.rpf` `0x7a` authored vehicle configurations.
+  - [@worstgirlinamerica](https://github.com/worstgirlinamerica) (PRs #30, #31, #32, #33) — `scripts/build_linux.sh`, AWC superblock directory & stereo channel fix in `awc_extract.py`, `cfg(windows)` gating, and explicit `f32` literal fix.
+  - [@Xyzstk](https://github.com/Xyzstk) (PRs #8, #29) — `SGD5` shader-group parser, `DXBC`/`FSSM` extraction, and reflection resource naming.
+  - [@techfoundrynz](https://github.com/techfoundrynz) (PRs #12, #13, #21–#28) — `>4 GiB` TTPF addressing, format 99 `float3` meshlets, world-scale MHIU terrain in GPU World, north-up 2D map & heightmap alignment, Model Viewer sidebar stability, window/taskbar icons, startup feedback, and `Cargo.lock` sync.
+  - [@asm512](https://github.com/asm512) (PR #19) — In-file & sibling vehicle LOD switching (`Hi`/`Mid`/`Low`, `LOD0`–`LOD3`) and per-texture material layers + Texture Browser.
+  - [@GamingChelsea](https://github.com/GamingChelsea) (PRs #10, #18) — `audio.rpf` DAT metadata catalog & AWC auto-naming, AWC decode diagnostics, superblock stream splitting, and waveform audio player foundation.
+  - [@Ahmet-Dedeler](https://github.com/Ahmet-Dedeler) ([Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars), PRs #6, #7, Issue #9) — macOS build & 3D viewer decoding, sorting, `RADTools.exe` fix, cutout/glass/decal blending, and licensing feedback.
+  - [@paryzius](https://github.com/paryzius) ([ttpf-viewer](https://github.com/paryzius/ttpf-viewer)) — `.ttpf` reduced-mip fallback for unreadable mip 0 chunks.
+  - [@holdmysocks](https://github.com/holdmysocks) ([SixNG](https://github.com/holdmysocks/SixNG)) — `0DRPz` (`0x7a`) map placement schema for world entity streaming.
+- **Bug Reports & Feature Suggestions (Issues):**
+  - [@YellowMaker](https://github.com/YellowMaker) (#20 — 2D world map orientation), [@adamjuankili](https://github.com/adamjuankili) (#17 — GPU World `m_vb` VRAM crash), [@crexlight](https://github.com/crexlight) (#16 — police dispatch `.awc` sample rate), [@Bluredguy](https://github.com/Bluredguy) (#15 — `binkplay.exe` path lookup), [@rbence05](https://github.com/rbence05) (#14 — PSIN placed scene assembly), [@kotelkonrad](https://github.com/kotelkonrad) (#11 — keyboard/arrow navigation across Explorer, models, audio & video), [@CedarCoder1](https://github.com/CedarCoder1) (#5 — copy file names & paths), [@Mrsuss60](https://github.com/Mrsuss60) (#4 — sort by name & size), [@adastmin1](https://github.com/adastmin1) (#2, #3 — multi-language & audio/text feedback).
 
 ---
 

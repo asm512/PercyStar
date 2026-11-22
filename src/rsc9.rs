@@ -15,7 +15,7 @@ pub fn is_qqqq_table(head: &[u8]) -> bool {
     }
     let cnt = rd32(head, 0x14);
     let p0 = rd64(head, 0x28);
-    rd64(head, 0) == 0 && (1..=200_000).contains(&cnt) && p0 >= 0x40 && p0 < 0x1000_0000
+    rd64(head, 0) == 0 && (1..=200_000).contains(&cnt) && (0x40..0x1000_0000).contains(&p0)
 }
 
 // detect rage 9 cinematic / cutscene rsc9 resource (pack:/cinematic + .anim)
@@ -106,8 +106,12 @@ pub fn parse_rsc9_generic(data: &[u8]) -> String {
 
     let _ = writeln!(out, "--- Header QWords ---");
     for o in (0..data.len().min(128)).step_by(16) {
+        // short or odd sized buffers end mid row
+        if o + 8 > data.len() {
+            break;
+        }
         let q0 = rd64(data, o);
-        let q1 = if o + 8 < data.len() { rd64(data, o + 8) } else { 0 };
+        let q1 = if o + 16 <= data.len() { rd64(data, o + 8) } else { 0 };
         let _ = writeln!(out, "  +0x{o:02x}: {q0:016x} {q1:016x}");
     }
 
@@ -159,7 +163,8 @@ pub fn parse_qqqq_table(data: &[u8]) -> String {
             break;
         }
         let target = rd64(data, poff) as usize;
-        if target + 32 > data.len() {
+        // target is a raw file value the sum must not wrap
+        if target.checked_add(32).map_or(true, |end| end > data.len()) {
             let _ = writeln!(out, "  [{idx:04}] -> 0x{target:06x} (out of range)");
             continue;
         }
@@ -178,6 +183,25 @@ pub fn parse_qqqq_table(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_and_hostile_buffers_do_not_panic() {
+        // lengths that are not a multiple of 16 used to read past the end of the header dump
+        for len in [0usize, 1, 7, 8, 9, 33, 40, 47, 100, 127, 128, 129] {
+            let _ = parse_rsc9_generic(&vec![0x41u8; len]);
+        }
+        // qqqq table whose second root pointer is close to u64 max
+        let mut t = vec![0u8; 0x80];
+        t[8..12].copy_from_slice(&0x7171_7171u32.to_le_bytes());
+        t[0x20..0x24].copy_from_slice(&2u32.to_le_bytes());
+        t[0x28..0x30].copy_from_slice(&0x40u64.to_le_bytes());
+        t[0x30..0x38].copy_from_slice(&0xFFFF_FFFF_FFFF_FFF0u64.to_le_bytes());
+        let out = parse_qqqq_table(&t);
+        assert!(out.contains("out of range") || !out.is_empty());
+        for cut in [0x28usize, 0x2c, 0x30, 0x38, 0x48] {
+            let _ = parse_qqqq_table(&t[..cut]);
+        }
+    }
 
     #[test]
     fn parses_synthetic_qqqq_table() {

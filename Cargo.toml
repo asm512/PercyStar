@@ -1,7 +1,8 @@
 [package]
 name = "rpf9_explorer"
-version = "1.4.1"
+version = "1.4.7"
 edition = "2021"
+rust-version = "1.89"
 
 [[bin]]
 name = "PercyStar"
@@ -19,6 +20,7 @@ winit = "0.30"
 glam = "0.29"
 bytemuck = { version = "1.21", features = ["derive"] }
 texture2ddecoder = "0.1.2"
+bcpack-rs = { git = "https://github.com/Ahmet-Dedeler/bcpack-rs", rev = "0a887de1edc9c22a425605091f1a8365fdf74dbb", default-features = false }
 
 [profile.release]
 opt-level = 3

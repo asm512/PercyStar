@@ -6,6 +6,10 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+// one minute up front and two hours of stereo at 48 khz at most per stream
+const MAX_RESERVE_SAMPLES: usize = 48_000 * 2 * 60;
+const MAX_STREAM_SAMPLES: usize = 48_000 * 2 * 7200;
+
 #[derive(Debug, Clone)]
 pub struct AwcDecodeResult {
     pub wavs: Vec<(u32, PathBuf)>,
@@ -103,7 +107,7 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
     let sc = ru32(data, 8) as usize;
     let raw_hdr_sz = ru32(data, 12) as usize;
     let hdr_sz = raw_hdr_sz.min(data.len());
-    if sc == 0 || sc > 65536 || 16 + sc * 4 > data.len() {
+    if sc == 0 || sc > 65536 || 16 + sc * 2 > data.len() {
         let mut details = Vec::new();
         push_hex_dump(&mut details, "ADAT head", data, 0, 128);
         return ParsedAdatHeader::Err {
@@ -112,67 +116,99 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
         };
     }
 
-    let mut data_chunks: Vec<(usize, usize, u32)> = Vec::new();
-    let mut format_rates: Vec<u32> = Vec::new();
-    let mut off = 16 + sc * 4;
-    if off + 8 > hdr_sz {
-        let mut details = vec![format!("flags=0x{flags:08X}, payload={} bytes", data.len())];
-        push_hex_dump(&mut details, "ADAT header", data, 0, hdr_sz.max(64).min(512));
-        return ParsedAdatHeader::Err {
-            summary: format!("ADAT header too small for chunk table (table_off=0x{off:X}, hdr_sz=0x{hdr_sz:X}, raw_hdr_sz=0x{raw_hdr_sz:X}, sc={sc})"),
-            details,
-        };
+    struct CandidateScan {
+        data_chunks: Vec<(usize, usize, u32)>,
+        format_rates: Vec<u32>,
+        total_entries: usize,
+        tag_counts: BTreeMap<u8, usize>,
+        sample_entries: Vec<String>,
+        skipped_chunks: Vec<String>,
+        bogus: usize,
     }
 
-    let mut total_entries = 0usize;
-    let mut tag_counts: BTreeMap<u8, usize> = BTreeMap::new();
-    let mut skipped_chunks: Vec<String> = Vec::new();
-    let mut sample_entries: Vec<String> = Vec::new();
-
-    // unpack 64bit tag size offset entries lookign for 0x55 data blocks and 0x76 format chunks
-    while off + 8 <= hdr_sz {
-        let val = ru64(data, off);
-        let tag = (val >> 56) as u8;
-        let sz = ((val >> 28) & 0x0FFF_FFFF) as usize;
-        let coff = (val & 0x0FFF_FFFF) as usize;
-        if tag == 0 && coff == 0 {
-            break;
-        }
-        total_entries += 1;
-        *tag_counts.entry(tag).or_insert(0) += 1;
-        if sample_entries.len() < 8 {
-            sample_entries.push(format!("tag=0x{tag:02X} off=0x{coff:X} sz={sz}"));
-        }
-        if tag == 0x76 && sz >= 10 && coff + 10 <= data.len() {
-            let sr = ru16(data, coff + 8) as u32;
-            if (8_000..=192_000).contains(&sr) {
-                format_rates.push(sr);
-                if let Some(last) = data_chunks.last_mut() {
-                    if last.2 == 0 {
-                        last.2 = sr;
+    let scan_forward = |start_off: usize| -> CandidateScan {
+        let mut off = start_off;
+        let mut data_chunks: Vec<(usize, usize, u32)> = Vec::new();
+        let mut format_rates: Vec<u32> = Vec::new();
+        let mut total_entries = 0usize;
+        let mut tag_counts: BTreeMap<u8, usize> = BTreeMap::new();
+        let mut skipped_chunks: Vec<String> = Vec::new();
+        let mut sample_entries: Vec<String> = Vec::new();
+        let mut bogus = 0usize;
+        while off + 8 <= hdr_sz {
+            let val = ru64(data, off);
+            let tag = (val >> 56) as u8;
+            let sz = ((val >> 28) & 0x0FFF_FFFF) as usize;
+            let coff = (val & 0x0FFF_FFFF) as usize;
+            if tag == 0 && coff == 0 {
+                break;
+            }
+            total_entries += 1;
+            *tag_counts.entry(tag).or_insert(0) += 1;
+            if sample_entries.len() < 8 {
+                sample_entries.push(format!("tag=0x{tag:02X} off=0x{coff:X} sz={sz}"));
+            }
+            if tag == 0x76 && sz >= 10 && coff + 10 <= data.len() {
+                let sr = ru16(data, coff + 8) as u32;
+                if (8_000..=192_000).contains(&sr) {
+                    format_rates.push(sr);
+                    if let Some(last) = data_chunks.last_mut() {
+                        if last.2 == 0 {
+                            last.2 = sr;
+                        }
                     }
                 }
+            } else if tag == 0x55 {
+                if sz == 0 {
+                    bogus += 1;
+                    skipped_chunks.push(format!("0x55 chunk at off=0x{coff:X} has sz=0"));
+                } else if coff < 0x20 {
+                    bogus += 1;
+                    skipped_chunks.push(format!("0x55 chunk has invalid off=0x{coff:X} (< 0x20), sz={sz}"));
+                } else if coff >= data.len() {
+                    bogus += 1;
+                    skipped_chunks.push(format!("0x55 chunk out of bounds: off=0x{coff:X} >= len={}", data.len()));
+                } else if coff + sz > data.len() {
+                    let avail = data.len() - coff;
+                    skipped_chunks.push(format!("0x55 chunk truncated in RPF (off=0x{coff:X}, header_sz={sz}, clamped to {avail} bytes)"));
+                    data_chunks.push((coff, avail, 0));
+                } else {
+                    data_chunks.push((coff, sz, 0));
+                }
+            } else if !matches!(tag, 0x48 | 0xA3 | 0xBD | 0xFA | 0xFF) || coff >= data.len() {
+                bogus += 1;
             }
-        } else if tag == 0x55 {
-            if sz == 0 {
-                skipped_chunks.push(format!("0x55 chunk at off=0x{coff:X} has sz=0"));
-            } else if coff < 0x20 {
-                skipped_chunks.push(format!("0x55 chunk has invalid off=0x{coff:X} (< 0x20), sz={sz}"));
-            } else if coff >= data.len() {
-                skipped_chunks.push(format!("0x55 chunk out of bounds: off=0x{coff:X} >= len={}", data.len()));
-            } else if coff + sz > data.len() {
-                let avail = data.len() - coff;
-                skipped_chunks.push(format!("0x55 chunk truncated in RPF (off=0x{coff:X}, header_sz={sz}, clamped to {avail} bytes)"));
-                data_chunks.push((coff, avail, 0));
-            } else {
-                data_chunks.push((coff, sz, 0));
-            }
+            off += 8;
         }
-        off += 8;
+        CandidateScan { data_chunks, format_rates, total_entries, tag_counts, sample_entries, skipped_chunks, bogus }
+    };
+
+    let mut candidates: Vec<(bool, CandidateScan)> = Vec::new();
+    let off_u32 = 16 + sc * 4;
+    let off_u16 = 16 + sc * 2;
+    let off_u16_aligned = (off_u16 + 7) & !7;
+    if off_u32 + 8 <= hdr_sz {
+        candidates.push((true, scan_forward(off_u32)));
+    }
+    if off_u16 != off_u32 && off_u16 + 8 <= hdr_sz {
+        candidates.push((false, scan_forward(off_u16)));
+    }
+    if off_u16_aligned != off_u16 && off_u16_aligned != off_u32 && off_u16_aligned + 8 <= hdr_sz {
+        candidates.push((false, scan_forward(off_u16_aligned)));
     }
 
-    // fallback walk backwards from hdr_sz in 8 byte steps when stream table is not 8 byte aligned
-    if data_chunks.is_empty() && hdr_sz >= 0x18 {
+    let mut best = candidates
+        .into_iter()
+        .max_by_key(|(is_u32, c)| {
+            let clean = c.data_chunks.iter().filter(|&&(coff, _, _)| coff >= hdr_sz).count() as isize;
+            let exact_sc = if c.data_chunks.len() == sc { 100isize } else { 0 };
+            (exact_sc + clean - (c.bogus as isize) * 4, c.data_chunks.len(), *is_u32, c.format_rates.len())
+        })
+        .map(|(_, c)| c);
+
+    if best.is_none() && hdr_sz >= 0x18 {
+        let mut data_chunks = Vec::new();
+        let mut format_rates = Vec::new();
         let mut back = hdr_sz;
         while back >= 0x18 {
             let entry_off = back - 8;
@@ -187,6 +223,49 @@ fn parse_adat_header(data: &[u8]) -> ParsedAdatHeader {
                 if (8_000..=192_000).contains(&sr) {
                     format_rates.push(sr);
                 }
+            } else if !matches!(tag, 0x48 | 0x55 | 0x76 | 0xA3 | 0xBD | 0xFA | 0xFF) && coff > data.len() {
+                break;
+            }
+            back -= 8;
+        }
+        data_chunks.reverse();
+        best = Some(CandidateScan {
+            data_chunks,
+            format_rates,
+            total_entries: 0,
+            tag_counts: BTreeMap::new(),
+            sample_entries: Vec::new(),
+            skipped_chunks: Vec::new(),
+            bogus: 0,
+        });
+    }
+
+    let Some(chosen) = best else {
+        let mut details = vec![format!("flags=0x{flags:08X}, payload={} bytes", data.len())];
+        push_hex_dump(&mut details, "ADAT header", data, 0, hdr_sz.max(64).min(512));
+        return ParsedAdatHeader::Err {
+            summary: format!("ADAT header too small for chunk table (table_off=0x{off_u32:X}, hdr_sz=0x{hdr_sz:X}, raw_hdr_sz=0x{raw_hdr_sz:X}, sc={sc})"),
+            details,
+        };
+    };
+
+    let mut data_chunks = chosen.data_chunks;
+    let format_rates = chosen.format_rates;
+    let total_entries = chosen.total_entries;
+    let tag_counts = chosen.tag_counts;
+    let sample_entries = chosen.sample_entries;
+    let skipped_chunks = chosen.skipped_chunks;
+
+    if data_chunks.is_empty() && hdr_sz >= 0x18 {
+        let mut back = hdr_sz;
+        while back >= 0x18 {
+            let entry_off = back - 8;
+            let val = ru64(data, entry_off);
+            let tag = (val >> 56) as u8;
+            let sz = ((val >> 28) & 0x0FFF_FFFF) as usize;
+            let coff = (val & 0x0FFF_FFFF) as usize;
+            if tag == 0x55 && sz > 0 && coff >= hdr_sz && coff < data.len() {
+                data_chunks.push((coff, sz.min(data.len() - coff), 0));
             } else if !matches!(tag, 0x48 | 0x55 | 0x76 | 0xA3 | 0xBD | 0xFA | 0xFF) && coff > data.len() {
                 break;
             }
@@ -372,7 +451,7 @@ fn decode_opus_chunk_into(
                 continue;
             }
             let dir_bytes = n_sub * 24 + total_blks * 4;
-            let dir_blks = ((dir_bytes + 2047) / 2048).max(1);
+            let dir_blks = dir_bytes.div_ceil(2048).max(1);
             let start_blk: usize = dir_blks + counts[..sub_idx].iter().sum::<usize>();
             let end_blk = start_blk + counts[sub_idx];
             let byte_start = start_blk * 2048;
@@ -392,13 +471,15 @@ fn decode_opus_chunk_into(
         return Err(notes);
     }
 
-    let ch: usize = if (packets[0][0] & 0x04) != 0 { 2 } else { 1 };
+    let toc = packets.iter().max_by_key(|p| p.len()).map(|p| p[0]).unwrap_or(packets[0][0]);
+    let ch: usize = if (toc & 0x04) != 0 { 2 } else { 1 };
     let mut dec = OpusDecoder::new(48_000, ch)
         .map_err(|err| vec![format!("Chunk #{idx} (ch={ch}): OpusDecoder::new(48000, {ch}) failed: {err:?}")])?;
     if pcm_f32.len() < 5760 * ch {
         pcm_f32.resize(5760 * ch, 0.0);
     }
-    let need = packets.len() * 960 * ch;
+    // the packet count comes from the file so the reservation is only a bounded hint
+    let need = packets.len().saturating_mul(960 * ch).min(MAX_RESERVE_SAMPLES);
     if samples_i16.capacity() < need {
         samples_i16.reserve(need - samples_i16.capacity());
     }
@@ -407,6 +488,10 @@ fn decode_opus_chunk_into(
     let mut first_err: Option<String> = None;
 
     for pkt in &packets {
+        // a chunk of minimal packets would otherwise decode to tens of gigabytes
+        if samples_i16.len() >= MAX_STREAM_SAMPLES {
+            break;
+        }
         match dec.decode(pkt, 5760, &mut pcm_f32[..5760 * ch]) {
             Ok(n_per_ch) => {
                 ok_pkts += 1;
@@ -493,7 +578,7 @@ where
                         }
                     }
                     let d = done_cnt.fetch_add(1, Ordering::Relaxed) + 1;
-                    if d == total || d % 8 == 0 {
+                    if d == total || d.is_multiple_of(8) {
                         on_progress(d, total);
                     }
                 }
@@ -696,5 +781,37 @@ mod tests {
         let res = decode_awc_bytes_in_memory(&adat, "dispatch", |_, _| {});
         assert_eq!(res.tracks.len(), 1);
         assert_eq!(res.tracks[0].sample_rate, 32_000);
+    }
+
+    #[test]
+    fn adat_u16_stream_table_parses_all_streams() {
+        let mut enc = OpusEncoder::new(48_000, 1, Application::Audio).unwrap();
+        let pcm = vec![0.0f32; 960];
+        let mut pkt = vec![0u8; 256];
+        let plen = enc.encode(&pcm, 960, &mut pkt).unwrap();
+        pkt.truncate(plen);
+
+        let mut blk = vec![0u8; 512];
+        blk[0..2].copy_from_slice(&(plen as u16).to_le_bytes());
+        blk[2..2 + plen].copy_from_slice(&pkt);
+
+        // Simulate 3-stream ADAT with a u16[3] stream table (16 + 3*2 = 22 bytes -> chunk table at 22)
+        let sc = 3usize;
+        let chunk_off = 16 + sc * 2;
+        let hdr_sz = chunk_off + sc * 8;
+        let mut adat = vec![0u8; hdr_sz + blk.len() * sc];
+        adat[0..4].copy_from_slice(b"ADAT");
+        adat[4..8].copy_from_slice(&0xFF02_0001u32.to_le_bytes());
+        adat[8..12].copy_from_slice(&(sc as u32).to_le_bytes());
+        adat[12..16].copy_from_slice(&(hdr_sz as u32).to_le_bytes());
+        for i in 0..sc {
+            let coff = hdr_sz + i * blk.len();
+            let e55: u64 = (0x55u64 << 56) | ((blk.len() as u64) << 28) | (coff as u64);
+            adat[chunk_off + i * 8..chunk_off + (i + 1) * 8].copy_from_slice(&e55.to_le_bytes());
+            adat[coff..coff + blk.len()].copy_from_slice(&blk);
+        }
+
+        let res = decode_awc_bytes_in_memory(&adat, "hud_u16", |_, _| {});
+        assert_eq!(res.tracks.len(), 3);
     }
 }

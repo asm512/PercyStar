@@ -90,7 +90,9 @@ pub fn parse_0drpz_map_entities(sys: &[u8]) -> Option<Vec<EntityPlacement>> {
             ];
             let sxy = rf32(sys, cur + 0x54);
             let sz_s = rf32(sys, cur + 0x58);
-            if pos.iter().all(|v| v.is_finite() && v.abs() < 30_000.0) && rot.iter().all(|v| v.is_finite()) {
+            // an all zero rotation is an empty slot and would normalize to nan downstream
+            let rot_len2: f32 = rot.iter().map(|v| v * v).sum();
+            if pos.iter().all(|v| v.is_finite() && v.abs() < 30_000.0) && rot_len2.is_finite() && rot_len2 > 1e-6 {
                 out.push(EntityPlacement {
                     archetype_hash: arch,
                     pos,
@@ -210,6 +212,11 @@ fn load_world_index(path: &Path, rpf_len: u64) -> Option<WorldIndex> {
     let map_count = ru64(&hdr, 12) as usize;
     let n_models = ru64(&hdr, 20) as usize;
     let n_ents = ru64(&hdr, 28) as usize;
+    // counts are cache file values they must fit in what is left of the file
+    let body = fs::metadata(path).ok()?.len().saturating_sub(36);
+    if (n_models as u64).saturating_mul(12).saturating_add((n_ents as u64).saturating_mul(40)) > body {
+        return None;
+    }
     let mut models = HashMap::with_capacity(n_models);
     let mut mbuf = [0u8; 12];
     for _ in 0..n_models {

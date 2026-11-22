@@ -19,6 +19,10 @@ fn vptr_off(ptr: u64) -> Option<usize> {
 // extract primary duration in seconds, track count, and clip hash seed from crClipDictionary
 pub fn extract_anim_summary(data: &[u8]) -> (f32, usize, u32) {
     let mut dur = 2.0f32;
+    // the seed fields below sit at 0x20 and 0x28
+    if data.len() < 0x30 {
+        return (dur, 1, 0);
+    }
     for o in (0x60..data.len().saturating_sub(0x38)).step_by(4) {
         let d = f32::from_bits(rd32(data, o));
         if d.is_finite() && (0.05..=3600.0).contains(&d) {
@@ -290,6 +294,14 @@ pub fn parse_anim_dict(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_of_a_short_buffer_does_not_panic() {
+        for len in [0usize, 4, 0x20, 0x24, 0x2f, 0x30, 0x60, 0x98, 0x200] {
+            let (dur, tracks, _) = extract_anim_summary(&vec![0u8; len]);
+            assert!(dur > 0.0 && tracks >= 1);
+        }
+    }
 
     #[test]
     fn probes_and_parses_synthetic_clip_dict() {

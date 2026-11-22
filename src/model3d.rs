@@ -2,11 +2,20 @@ use eframe::egui::{self, Color32, ColorImage, CornerRadius, RichText, TextureHan
 use flate2::{Decompress, FlushDecompress, Status};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+mod export;
+mod raster;
+mod shading;
+mod texture;
 mod vertex_stream;
+
+pub use shading::NormalSource;
+pub use texture::Texture2D;
+#[cfg(test)]
+use raster::rasterize_mesh;
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum ShadeMode {
@@ -15,13 +24,6 @@ pub enum ShadeMode {
     Solid,
     SolidWire,
     Wireframe,
-}
-
-#[derive(Clone)]
-pub struct Texture2D {
-    pub w: usize,
-    pub h: usize,
-    pub pixels: Vec<Color32>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -83,6 +85,34 @@ pub struct TexLayer {
     failed: bool,
 }
 
+#[derive(Clone, Copy)]
+pub struct ElsPoint {
+    pub position: [f32; 3],
+    pub bank: bool,
+    pub slot: u8,
+}
+
+// Decoded from the RAGE 9 Sirens PSO preset (id 3) in data.rpf. As in GTA V,
+// each light consumes one bit per beat, most-significant bit first. GTA VI keeps
+// the 32-step sequencers but stores the carcols-style data in hashed PSO fields.
+const RAGE9_SIREN_BPM: f64 = 500.0;
+const RAGE9_SIREN_MULTIPLES: u64 = 3;
+const RAGE9_SIREN_SEQUENCERS: [u32; 20] = [
+    0xAAAA_AAAA, 0xAA00_AA80, 0x5500_5500, 0x5555_5555,
+    0xAA5A_A954, 0x5555_554A, 0x5555_554A, 0xAA5A_A954,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+fn rage9_siren_lit(slot: u8, phase: u64) -> bool {
+    let Some(&sequencer) = slot.checked_sub(1).and_then(|i| RAGE9_SIREN_SEQUENCERS.get(i as usize)) else {
+        return false;
+    };
+    let subdivisions = RAGE9_SIREN_MULTIPLES * 2;
+    let beat = (phase / subdivisions) % 32;
+    let pulse = phase % subdivisions;
+    sequencer & (1 << (31 - beat)) != 0 && pulse.is_multiple_of(2)
+}
+
 impl GeomMaterial {
     fn blends(&self, has_uvs: bool) -> bool {
         matches!(self.pass, MaterialPass::Glass { .. })
@@ -105,20 +135,10 @@ const PAINT_PRESETS: [(&str, [f32; 3]); 8] = [
     ("White", [0.93, 0.94, 0.96]),
 ];
 
-impl Texture2D {
-    #[inline]
-    pub fn sample(&self, u: f32, v: f32) -> Color32 {
-        if self.w == 0 || self.h == 0 {
-            return Color32::WHITE;
-        }
-        let x = ((u.rem_euclid(1.0) * (self.w as f32)) as usize).min(self.w - 1);
-        let y = ((v.rem_euclid(1.0) * (self.h as f32)) as usize).min(self.h - 1);
-        self.pixels[y * self.w + x]
-    }
-}
-
 const DEFAULT_YAW: f32 = 2.45;
 const DEFAULT_PITCH: f32 = 0.38;
+// render time budget of a frame while the camera moves
+const MOVING_FRAME_MS: f32 = 11.0;
 
 #[derive(Clone)]
 pub struct Mesh3D {
@@ -127,7 +147,12 @@ pub struct Mesh3D {
     pub uvs: Vec<[f32; 2]>,
     pub tris: Vec<[u32; 3]>,
     pub tri_geom: Vec<u16>,
+    // unit geometric normal of every triangle
     pub normals: Vec<[f32; 3]>,
+    // how shading normals are rebuilt see corner_normals
+    pub normal_source: NormalSource,
+    // faceted preview that shows the real triangles instead of smooth shading
+    pub flat_shading: bool,
     pub edges: Vec<(u32, u32)>,
     pub texture: Option<Texture2D>,
     pub geom_materials: Vec<GeomMaterial>,
@@ -135,6 +160,12 @@ pub struct Mesh3D {
     pub tex_layers: Vec<TexLayer>,
     pub has_paint_geom: bool,
     pub paint_color: [f32; 3],
+    pub has_els: bool,
+    pub els_enabled: bool,
+    pub els_flash: bool,
+    pub els_points: Vec<ElsPoint>,
+    vehicle_attach_points: Vec<(String, [f32; 3])>,
+    els_flash_phase: u64,
     pub tex_status: String,
     pub center: [f32; 3],
     pub radius: f32,
@@ -162,11 +193,20 @@ pub struct Mesh3D {
     fb_h: usize,
     color_buf: Vec<Color32>,
     z_buf: Vec<f32>,
-    proj_buf: Vec<[f32; 3]>,
+    id_buf: Vec<u32>,
+    proj_buf: Vec<[f32; 4]>,
+    fixed_buf: Vec<[i32; 2]>,
+    bins: Vec<Vec<u32>>,
+    blend_bins: Vec<Vec<u32>>,
     blend_order: Vec<(usize, f32, bool)>,
+    corner_normals: OnceLock<Vec<[[f32; 3]; 3]>>,
     tex: Option<TextureHandle>,
     pub dirty: bool,
-    last_dragging: bool,
+    // viewport size and quality of the frame on screen
+    view_size: (usize, usize),
+    view_refined: bool,
+    // cost of the last frame in milliseconds per megasample steers the resolution while the camera moves
+    frame_cost: f32,
 }
 
 impl Mesh3D {
@@ -219,20 +259,28 @@ impl Mesh3D {
     }
 
     fn refresh_tex_status(&mut self) {
-        if self.texture.is_some() || self.geom_materials.is_empty() {
+        if self.geom_materials.is_empty() {
             return;
         }
-        let textured = self.geom_materials.iter().filter(|m| m.texture.is_some()).count();
-        let paint = self.geom_materials.iter().filter(|m| m.is_vehicle_paint).count();
-        let drawn = self.geom_materials.iter().filter(|m| !m.auxiliary_pass).count().max(1);
-        if textured > 0 && paint > 0 {
-            self.tex_status = format!("TTPF: {textured}/{drawn} mats + Car Paint");
-        } else if textured > 0 {
-            self.tex_status = format!("TTPF: {textured}/{drawn} mats");
-        } else if paint > 0 {
-            self.tex_status = format!("Car Paint ({paint}/{drawn} geoms)");
-        } else if !self.tex_layers.is_empty() {
-            self.tex_status = "TTPF: no color textures applied".into();
+        if let Some(at) = self.tex_status.find(" + ELS ") {
+            self.tex_status.truncate(at);
+        }
+        if self.texture.is_none() {
+            let textured = self.geom_materials.iter().filter(|m| m.texture.is_some()).count();
+            let paint = self.geom_materials.iter().filter(|m| m.is_vehicle_paint).count();
+            let drawn = self.geom_materials.iter().filter(|m| !m.auxiliary_pass).count().max(1);
+            if textured > 0 && paint > 0 {
+                self.tex_status = format!("TTPF: {textured}/{drawn} mats + Car Paint");
+            } else if textured > 0 {
+                self.tex_status = format!("TTPF: {textured}/{drawn} mats");
+            } else if paint > 0 {
+                self.tex_status = format!("Car Paint ({paint}/{drawn} geoms)");
+            } else if !self.tex_layers.is_empty() {
+                self.tex_status = "TTPF: no color textures applied".into();
+            }
+        }
+        if self.has_els {
+            self.tex_status.push_str(&format!(" + ELS {} emitters", self.els_points.len()));
         }
     }
 
@@ -300,12 +348,20 @@ impl Mesh3D {
             tris,
             tri_geom,
             normals,
+            normal_source: NormalSource::Crease,
+            flat_shading: false,
             edges,
             texture,
             geom_materials: Vec::new(),
             has_paint_geom: false,
             tex_layers: Vec::new(),
             paint_color: DEFAULT_PAINT_COLOR,
+            has_els: false,
+            els_enabled: false,
+            els_flash: true,
+            els_points: Vec::new(),
+            vehicle_attach_points: Vec::new(),
+            els_flash_phase: 0,
             tex_status,
             center,
             radius,
@@ -329,12 +385,30 @@ impl Mesh3D {
             fb_h: 0,
             color_buf: Vec::new(),
             z_buf: Vec::new(),
+            id_buf: Vec::new(),
             proj_buf: Vec::new(),
+            fixed_buf: Vec::new(),
+            bins: Vec::new(),
+            blend_bins: Vec::new(),
             blend_order: Vec::new(),
+            corner_normals: OnceLock::new(),
             tex: None,
             dirty: true,
-            last_dragging: false,
+            view_size: (0, 0),
+            view_refined: false,
+            frame_cost: 0.0,
         }
+    }
+
+    // unit shading normal of every triangle corner rebuilt from topology on first use
+    pub fn corner_normals(&self) -> &[[[f32; 3]; 3]] {
+        self.corner_normals.get_or_init(|| shading::corner_normals(&self.verts, &self.tris, &self.normals, self.normal_source))
+    }
+
+    // call after replacing vertices or triangles so shading normals are rebuilt
+    pub fn invalidate_normals(&mut self) {
+        self.corner_normals = OnceLock::new();
+        self.dirty = true;
     }
 
     // triangle range currently shown either active part or everything
@@ -369,44 +443,89 @@ impl Mesh3D {
         self.dirty = true;
     }
 
-    // writes visible parts as obj one group per drawable and recenters isolated part
-    pub fn export_obj(&self, path: &Path) -> std::io::Result<()> {
-        let mut w = BufWriter::new(File::create(path)?);
-        writeln!(w, "# PercyStar RAGE9 Model Export: {}", self.name)?;
-        let groups: Vec<(&str, std::ops::Range<usize>)> = match self.active_part.and_then(|i| self.parts.get(i)) {
-            Some(p) => vec![(p.name.as_str(), self.visible_tris())],
-            None if !self.parts.is_empty() => self.parts.iter().map(|p| (p.name.as_str(), p.tris.clone())).collect(),
-            None => vec![(self.name.as_str(), 0..self.tris.len())],
+    // Adds an independently stored vehicle option at the same model-space
+    // origin. RAGE 9 tuning parts (bumpers, light bars, liveries, wheels, etc.)
+    // are separate fragment resources authored against the parent vehicle.
+    pub fn append_vehicle_part(&mut self, mut part: Mesh3D) {
+        let offset = if part.name.to_ascii_lowercase().starts_with("cmn_siren_roofbar1_") {
+            self.vehicle_attach_points
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("siren_roof_1"))
+                .map(|(_, position)| *position)
+                .unwrap_or([0.0; 3])
+        } else {
+            [0.0; 3]
         };
-        let shift = if self.active_part.is_some() { [self.center[0], self.center[1], 0.0] } else { [0.0; 3] };
-        let has_uv = self.uvs.len() == self.verts.len() && !self.uvs.is_empty();
-        let mut remap = vec![0u32; self.verts.len()];
-        let mut next = 1u32;
-        for (name, range) in groups {
-            writeln!(w, "o {name}")?;
-            let tris = &self.tris[range];
-            for &i in tris.iter().flatten() {
-                let i = i as usize;
-                if remap[i] == 0 {
-                    remap[i] = next;
-                    next += 1;
-                    let v = self.verts[i];
-                    writeln!(w, "v {:.6} {:.6} {:.6}", v[0] - shift[0], v[1] - shift[1], v[2] - shift[2])?;
-                    if has_uv {
-                        writeln!(w, "vt {:.6} {:.6}", self.uvs[i][0], self.uvs[i][1])?;
-                    }
+        if offset != [0.0; 3] {
+            for vertex in &mut part.verts {
+                for axis in 0..3 {
+                    vertex[axis] += offset[axis];
                 }
             }
-            for t in tris {
-                let (a, b, c) = (remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]);
-                if has_uv {
-                    writeln!(w, "f {a}/{a} {b}/{b} {c}/{c}")?;
-                } else {
-                    writeln!(w, "f {a} {b} {c}")?;
+            for light in &mut part.els_points {
+                for axis in 0..3 {
+                    light.position[axis] += offset[axis];
+                }
+            }
+            for (_, point) in &mut part.vehicle_attach_points {
+                for axis in 0..3 {
+                    point[axis] += offset[axis];
                 }
             }
         }
-        Ok(())
+        let vertex_base = self.verts.len() as u32;
+        let triangle_base = self.tris.len();
+        let geom_base = self.geom_materials.len() as u16;
+        let layer_base = self.tex_layers.len() as u16;
+        if self.parts.is_empty() && triangle_base > 0 {
+            self.parts.push(MeshPart {
+                name: self.name.clone(),
+                geoms: self.geom_count,
+                tris: 0..triangle_base,
+            });
+        }
+
+        self.verts.append(&mut part.verts);
+        self.uvs.append(&mut part.uvs);
+        self.normals.append(&mut part.normals);
+        self.tris.extend(part.tris.drain(..).map(|t| {
+            [t[0] + vertex_base, t[1] + vertex_base, t[2] + vertex_base]
+        }));
+        self.tri_geom.extend(part.tri_geom.drain(..).map(|g| g.saturating_add(geom_base)));
+        self.edges.extend(part.edges.drain(..).map(|(a, b)| (a + vertex_base, b + vertex_base)));
+
+        for material in &mut part.geom_materials {
+            for layer in material
+                .color_layers
+                .iter_mut()
+                .chain(&mut material.normal_layers)
+                .chain(&mut material.overlay_layers)
+            {
+                *layer = layer.saturating_add(layer_base);
+            }
+        }
+        self.geom_materials.append(&mut part.geom_materials);
+        self.tex_layers.append(&mut part.tex_layers);
+        self.els_points.append(&mut part.els_points);
+        self.vehicle_attach_points.append(&mut part.vehicle_attach_points);
+
+        let triangle_end = self.tris.len();
+        if triangle_end > triangle_base {
+            self.parts.push(MeshPart {
+                name: part.name,
+                geoms: part.geom_count,
+                tris: triangle_base..triangle_end,
+            });
+        }
+        self.geom_count += part.geom_count;
+        self.meshlet_count += part.meshlet_count;
+        self.bone_count = self.bone_count.max(part.bone_count);
+        self.has_els |= part.has_els;
+        self.active_part = None;
+        // merged vertices and triangles invalidate the cached shading normals
+        self.invalidate_normals();
+        self.set_active_part(None);
+        self.apply_tex_layers();
     }
 }
 
@@ -610,7 +729,8 @@ pub fn read_virtual_from_file(f: &mut File, file_off: u64) -> Result<(Vec<u8>, u
     }
     let v_cnt = v[bmap_off + 8] as usize;
     let p_cnt = v[bmap_off + 9] as usize;
-    if !(1..=32).contains(&v_cnt) || !(1..=64).contains(&p_cnt) {
+    // Meta-only 0x7a resources legitimately use p_cnt = 0 (no graphics pages).
+    if !(1..=32).contains(&v_cnt) || p_cnt > 64 {
         return Err(format!("Invalid RAGE9 BlockMap counts (v={v_cnt}, p={p_cnt})"));
     }
     for _ in v_chunks_read..v_cnt {
@@ -1349,6 +1469,116 @@ fn extract_rage9_bone_count(v: &[u8]) -> usize {
     0
 }
 
+fn quat_mul(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+fn quat_rotate(q: [f32; 4], p: [f32; 3]) -> [f32; 3] {
+    let qv = [q[0], q[1], q[2]];
+    let uv = [
+        qv[1] * p[2] - qv[2] * p[1],
+        qv[2] * p[0] - qv[0] * p[2],
+        qv[0] * p[1] - qv[1] * p[0],
+    ];
+    let uuv = [
+        qv[1] * uv[2] - qv[2] * uv[1],
+        qv[2] * uv[0] - qv[0] * uv[2],
+        qv[0] * uv[1] - qv[1] * uv[0],
+    ];
+    [
+        p[0] + 2.0 * (q[3] * uv[0] + uuv[0]),
+        p[1] + 2.0 * (q[3] * uv[1] + uuv[1]),
+        p[2] + 2.0 * (q[3] * uv[2] + uuv[2]),
+    ]
+}
+
+fn rage9_siren_slot(name: &str) -> Option<u16> {
+    let lower = name.to_ascii_lowercase();
+    let siren_at = lower.rfind("siren")?;
+    lower[siren_at + "siren".len()..].parse::<u16>().ok()
+}
+
+// RAGE 9 vehicle ELS emitters are skeleton bones whose final token is siren<number>,
+// for example siren1, ext_front_siren2, or ext_rear_1_roof_siren1.
+// They are independent from emissiveTex, which is commonly the dashboard gauge atlas.
+fn extract_rage9_skeleton_points(v: &[u8]) -> (Vec<ElsPoint>, Vec<(String, [f32; 3])>) {
+    let mut bases = vec![0usize];
+    if v.len() >= 0x20 {
+        if let Some(fo) = vptr(ru64(v, 0x18)) {
+            if fo + 0x20 <= v.len() { bases.push(fo); }
+        }
+    }
+    for base in bases {
+        let Some(so) = (base + 0x20 <= v.len()).then(|| vptr(ru64(v, base + 0x18))).flatten() else { continue };
+        if so + 0x70 > v.len() { continue; }
+        let count = ru16(v, so + 0x6c) as usize;
+        let Some(bones) = vptr(ru64(v, so + 0x28)) else { continue };
+        if !(1..=1024).contains(&count) || bones + count * 0x50 > v.len() { continue; }
+
+        let mut world_rot = vec![[0.0, 0.0, 0.0, 1.0]; count];
+        let mut world_pos = vec![[0.0; 3]; count];
+        let mut world_scale = vec![[1.0; 3]; count];
+        let mut out = Vec::new();
+        let mut attach_points = Vec::new();
+        for i in 0..count {
+            let b = bones + i * 0x50;
+            let mut rot = [rf32(v, b), rf32(v, b + 4), rf32(v, b + 8), rf32(v, b + 12)];
+            let len = (rot.iter().map(|x| x * x).sum::<f32>()).sqrt();
+            if len > 1e-6 {
+                for x in &mut rot { *x /= len; }
+            } else {
+                rot = [0.0, 0.0, 0.0, 1.0];
+            }
+            let pos = [rf32(v, b + 0x10), rf32(v, b + 0x14), rf32(v, b + 0x18)];
+            let scale = [rf32(v, b + 0x20), rf32(v, b + 0x24), rf32(v, b + 0x28)];
+            let parent = ru16(v, b + 0x46) as usize;
+            if parent < i {
+                let scaled = [
+                    pos[0] * world_scale[parent][0],
+                    pos[1] * world_scale[parent][1],
+                    pos[2] * world_scale[parent][2],
+                ];
+                let offset = quat_rotate(world_rot[parent], scaled);
+                world_pos[i] = [
+                    world_pos[parent][0] + offset[0],
+                    world_pos[parent][1] + offset[1],
+                    world_pos[parent][2] + offset[2],
+                ];
+                world_rot[i] = quat_mul(world_rot[parent], rot);
+                world_scale[i] = [
+                    world_scale[parent][0] * scale[0],
+                    world_scale[parent][1] * scale[1],
+                    world_scale[parent][2] * scale[2],
+                ];
+            } else {
+                world_pos[i] = pos;
+                world_rot[i] = rot;
+                world_scale[i] = scale;
+            }
+
+            let Some(name_off) = vptr(ru64(v, b + 0x30)) else { continue };
+            let end = v[name_off..].iter().position(|&c| c == 0).map(|n| name_off + n).unwrap_or(name_off);
+            let Ok(name) = std::str::from_utf8(&v[name_off..end]) else { continue };
+            attach_points.push((name.to_string(), world_pos[i]));
+            let Some(number) = rage9_siren_slot(name) else { continue };
+            out.push(ElsPoint {
+                position: world_pos[i],
+                bank: number % 2 == 0,
+                slot: number.min(u8::MAX as u16) as u8,
+            });
+        }
+        if !out.is_empty() || !attach_points.is_empty() {
+            return (out, attach_points);
+        }
+    }
+    (Vec::new(), Vec::new())
+}
+
 pub fn decode_rage9_model_from_rpf(rpf_path: &Path, file_off: u64, fallback_name: &str) -> Result<Mesh3D, String> {
     decode_rage9_model_from_rpf_lod(rpf_path, file_off, fallback_name, 0)
 }
@@ -1465,6 +1695,10 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
     }
     layout_parts_in_grid(&mut b.verts, &part_verts);
 
+    // Optional vehicle fragments are often too small to pass the whole-vehicle
+    // classifier but can still carry their own siren emitter bones.
+    let (els_points, vehicle_attach_points) = extract_rage9_skeleton_points(&v);
+
     // default look applies the first color candidate of every drawn material
     for m in geom_materials.iter().filter(|m| !m.auxiliary_pass) {
         for &i in m.color_layers.iter().chain(&m.normal_layers).chain(&m.overlay_layers) {
@@ -1491,8 +1725,12 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
         b.meshlets,
         lod_label,
     );
+    mesh.normal_source = NormalSource::SharedVertices;
     mesh.geom_materials = geom_materials;
     mesh.tex_layers = tex_layers;
+    mesh.has_els = !els_points.is_empty();
+    mesh.els_points = els_points;
+    mesh.vehicle_attach_points = vehicle_attach_points;
     mesh.apply_tex_layers();
     mesh.bone_count = extract_rage9_bone_count(&v);
     mesh.lod = lod;
@@ -1501,435 +1739,6 @@ pub fn decode_rage9_model_from_rpf_lod(rpf_path: &Path, file_off: u64, fallback_
         mesh.parts = parts;
     }
     Ok(mesh)
-}
-
-#[inline]
-fn draw_line_z(
-    color_buf: &mut [Color32],
-    z_buf: &mut [f32],
-    w: usize,
-    h: usize,
-    p0: [f32; 3],
-    p1: [f32; 3],
-    col: Color32,
-    z_bias: f32,
-) {
-    let dx = p1[0] - p0[0];
-    let dy = p1[1] - p0[1];
-    let steps = dx.abs().max(dy.abs());
-    if steps < 0.5 || steps > 4000.0 {
-        return;
-    }
-    let n = steps.ceil() as i32;
-    let inv = 1.0 / (n as f32);
-    let sx = dx * inv;
-    let sy = dy * inv;
-    let sz = (p1[2] - p0[2]) * inv;
-    let mut x = p0[0];
-    let mut y = p0[1];
-    let mut z = p0[2] + z_bias;
-    for _ in 0..=n {
-        let xi = x as i32;
-        let yi = y as i32;
-        if xi >= 0 && yi >= 0 && (xi as usize) < w && (yi as usize) < h {
-            let idx = (yi as usize) * w + (xi as usize);
-            if z >= z_buf[idx] {
-                z_buf[idx] = z;
-                color_buf[idx] = col;
-            }
-        }
-        x += sx;
-        y += sy;
-        z += sz;
-    }
-}
-
-#[inline]
-fn blend_preview_pixel(dst: &mut Color32, src: Color32, alpha: u8) {
-    let a = alpha as u16;
-    let mix = |s: u8, d: u8| ((s as u16 * a + d as u16 * (255 - a) + 127) / 255) as u8;
-    *dst = Color32::from_rgb(mix(src.r(), dst.r()), mix(src.g(), dst.g()), mix(src.b(), dst.b()));
-}
-
-fn rasterize_mesh(mesh: &mut Mesh3D, w: usize, h: usize) {
-    let npix = w * h;
-    if mesh.fb_w != w || mesh.fb_h != h {
-        mesh.fb_w = w;
-        mesh.fb_h = h;
-        mesh.color_buf.resize(npix, Color32::from_rgb(13, 14, 18));
-        mesh.z_buf.resize(npix, f32::NEG_INFINITY);
-    }
-
-    for y in 0..h {
-        let t = (y as f32) / (h.max(1) as f32);
-        let c = if mesh.sky_bg {
-            if t < 0.56 {
-                let s = t / 0.56;
-                Color32::from_rgb(
-                    (78.0 + s * 108.0) as u8,
-                    (134.0 + s * 84.0) as u8,
-                    (202.0 + s * 40.0) as u8,
-                )
-            } else {
-                let s = (t - 0.56) / 0.44;
-                Color32::from_rgb(
-                    (52.0 - s * 22.0) as u8,
-                    (78.0 - s * 28.0) as u8,
-                    (102.0 - s * 30.0) as u8,
-                )
-            }
-        } else {
-            Color32::from_rgb(
-                (11.0 + t * 9.0) as u8,
-                (12.0 + t * 10.0) as u8,
-                (17.0 + t * 14.0) as u8,
-            )
-        };
-        mesh.color_buf[y * w..(y + 1) * w].fill(c);
-    }
-    mesh.z_buf.fill(f32::NEG_INFINITY);
-
-    let (sy, cy) = mesh.yaw.sin_cos();
-    let (sp, cp) = mesh.pitch.sin_cos();
-    let min_dim = (w.min(h) as f32) * 0.44;
-    let scale = (min_dim / mesh.radius) * mesh.zoom;
-    let cx = (w as f32) * 0.5 + mesh.pan_x * (w as f32);
-    let cy_s = (h as f32) * 0.5 + mesh.pan_y * (h as f32);
-    let ctr = mesh.center;
-    let persp_k = 1.0 / (mesh.radius * 4.5);
-
-    mesh.proj_buf.resize(mesh.verts.len(), [0.0; 3]);
-    for (dst, v) in mesh.proj_buf.iter_mut().zip(&mesh.verts) {
-        let x = v[0] - ctr[0];
-        let y = v[1] - ctr[1];
-        let z = v[2] - ctr[2];
-        let x1 = x * cy - y * sy;
-        let y1 = x * sy + y * cy;
-        let y2 = -y1 * cp + z * sp;
-        let z2 = z * cp + y1 * sp;
-        let persp = 1.0 / (1.0 - (y2 * persp_k).clamp(-0.65, 0.65));
-        *dst = [cx + x1 * scale * persp, cy_s - z2 * scale * persp, y2];
-    }
-
-    let wf = w as f32;
-    let hf = h as f32;
-
-    if !mesh.tris.is_empty() {
-        let do_textured = mesh.shade_mode == ShadeMode::Textured;
-        let do_solid = matches!(mesh.shade_mode, ShadeMode::Textured | ShadeMode::Solid | ShadeMode::SolidWire);
-        let do_wire = matches!(mesh.shade_mode, ShadeMode::Wireframe | ShadeMode::SolidWire);
-        let has_uvs = mesh.uvs.len() == mesh.verts.len() && !mesh.uvs.is_empty();
-
-        const MAT_PALETTE: [[f32; 3]; 12] = [
-            [0.82, 0.84, 0.88], [0.24, 0.26, 0.30], [0.18, 0.24, 0.32], [0.72, 0.75, 0.80],
-            [0.34, 0.36, 0.40], [0.86, 0.24, 0.24], [0.48, 0.50, 0.56], [0.28, 0.24, 0.22],
-            [0.78, 0.72, 0.62], [0.38, 0.44, 0.52], [0.64, 0.66, 0.70], [0.20, 0.21, 0.24],
-        ];
-        let l1 = [0.42f32, 0.65f32, 0.63f32];
-        let l2 = [-0.60f32, 0.25f32, -0.45f32];
-
-        if do_solid {
-            let vis = mesh.visible_tris();
-            let has_preview_texture = do_textured && has_uvs
-                && mesh.geom_materials.iter().any(|m| m.pass == MaterialPass::Cutout && m.texture.is_none())
-                && mesh.tri_geom.get(vis.clone()).is_some_and(|ids| {
-                    ids.iter().any(|&g| mesh.geom_materials.get(g as usize).is_some_and(|m| m.texture.is_some()))
-                });
-            let use_blending = do_textured && mesh.texture.is_none()
-                && mesh.geom_materials.iter().any(|m| m.blends(has_uvs));
-            let blend_material = |ti: usize| {
-                if !use_blending { return None; }
-                let g = mesh.tri_geom.get(ti).copied().unwrap_or(0) as usize;
-                mesh.geom_materials.get(g).filter(|m| m.blends(has_uvs) && !m.auxiliary_pass)
-            };
-            mesh.blend_order.clear();
-            if use_blending {
-                for ti in vis.clone() {
-                    if let Some(mat) = blend_material(ti) {
-                        let [a, b, c] = mesh.tris[ti].map(|i| mesh.proj_buf[i as usize][2]);
-                        mesh.blend_order.push((ti, a + b + c, mat.pass == MaterialPass::Decal));
-                    }
-                }
-                mesh.blend_order.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.total_cmp(&b.1)));
-            }
-            let solid_tris = vis.filter(|&ti| blend_material(ti).is_none());
-            for ti in solid_tris.chain(mesh.blend_order.iter().map(|&(ti, _, _)| ti)) {
-                let t = mesh.tris[ti];
-                let g = mesh.tri_geom.get(ti).copied().unwrap_or(0) as usize;
-                let gmat = mesh.geom_materials.get(g);
-                let active_tex: Option<&Texture2D> = if do_textured && has_uvs {
-                    mesh.texture.as_ref().or_else(|| gmat.and_then(|m| m.texture.as_deref()))
-                } else {
-                    None
-                };
-                if do_textured && gmat.is_some_and(|m| m.auxiliary_pass
-                    || (m.pass == MaterialPass::Cutout && active_tex.is_none() && has_preview_texture))
-                {
-                    continue;
-                }
-                // normal map and multiply overlays of the material only in textured mode without a manual texture
-                let layered = do_textured && has_uvs && mesh.texture.is_none();
-                let normal_tex: Option<&Texture2D> = if layered { gmat.and_then(|m| m.normal.as_deref()) } else { None };
-                let overlay_texs: &[Arc<Texture2D>] = match gmat {
-                    Some(m) if layered => &m.overlays,
-                    _ => &[],
-                };
-                let blend = blend_material(ti).is_some();
-                let pass = if do_textured && mesh.texture.is_some() {
-                    MaterialPass::Cutout
-                } else if do_textured {
-                    gmat.map_or(MaterialPass::Opaque, |m| m.pass)
-                } else {
-                    MaterialPass::Opaque
-                };
-                let glass = matches!(pass, MaterialPass::Glass { .. });
-                let depth_bias = if blend && pass == MaterialPass::Decal { mesh.radius * 0.0001 } else { 0.0 };
-
-                let i0 = t[0] as usize;
-                let i1 = t[1] as usize;
-                let i2 = t[2] as usize;
-                let p0 = mesh.proj_buf[i0];
-                let p1 = mesh.proj_buf[i1];
-                let p2 = mesh.proj_buf[i2];
-
-                let min_x = p0[0].min(p1[0]).min(p2[0]);
-                let max_x = p0[0].max(p1[0]).max(p2[0]);
-                let min_y = p0[1].min(p1[1]).min(p2[1]);
-                let max_y = p0[1].max(p1[1]).max(p2[1]);
-                if max_x < 0.0 || min_x >= wf || max_y < 0.0 || min_y >= hf {
-                    continue;
-                }
-
-                let area = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0]);
-                let abs_area = area.abs();
-                if abs_area < 0.15 {
-                    continue;
-                }
-
-                // world vector into the lighting frame
-                let to_view = |n: [f32; 3]| {
-                    let ny1 = n[0] * sy + n[1] * cy;
-                    [n[0] * cy - n[1] * sy, -ny1 * cp + n[2] * sp, n[2] * cp + ny1 * sp]
-                };
-                // rgb shade factors plus the main light term and rim used by the paint clearcoat
-                let shade_of = |nv: [f32; 3]| {
-                    let ndl1 = (nv[0] * l1[0] + nv[1] * l1[1] + nv[2] * l1[2]).abs();
-                    let ndl2 = (nv[0] * l2[0] + nv[1] * l2[1] + nv[2] * l2[2]).max(0.0);
-                    let spec = ndl1.powi(10) * 0.35;
-                    let rim = (1.0 - nv[1].abs()).powi(2) * 0.22;
-                    (
-                        [
-                            (0.18 + ndl1 * 0.72 + spec + rim * 0.45).min(1.15),
-                            (0.18 + ndl1 * 0.72 + ndl2 * 0.18 + spec + rim * 0.40).min(1.15),
-                            (0.20 + ndl1 * 0.70 + ndl2 * 0.28 + spec + rim * 0.55).min(1.15),
-                        ],
-                        ndl1,
-                        rim,
-                    )
-                };
-                let n_view = to_view(mesh.normals[ti]);
-                let ([shade_r, shade_g, shade_b], ndl1, rim) = shade_of(n_view);
-
-                let is_paint = do_textured
-                    && active_tex.is_none()
-                    && gmat.map(|m| m.is_vehicle_paint).unwrap_or(false);
-                let base_albedo = if is_paint {
-                    mesh.paint_color
-                } else if glass {
-                    [0.62, 0.71, 0.78]
-                } else if do_textured && active_tex.is_none() {
-                    MAT_PALETTE[g % MAT_PALETTE.len()]
-                } else {
-                    [0.86, 0.88, 0.92]
-                };
-                let clearcoat = if is_paint { ndl1.powi(24) * 0.55 + rim * 0.14 } else { 0.0 };
-                let flat_col = Color32::from_rgb(
-                    ((base_albedo[0] * shade_r + clearcoat).min(1.0) * 255.0) as u8,
-                    ((base_albedo[1] * shade_g + clearcoat).min(1.0) * 255.0) as u8,
-                    ((base_albedo[2] * shade_b + clearcoat).min(1.0) * 255.0) as u8,
-                );
-
-                let ix0 = (min_x.floor() as i32).max(0) as usize;
-                let ix1 = (max_x.ceil() as i32).min(w as i32 - 1) as usize;
-                let iy0 = (min_y.floor() as i32).max(0) as usize;
-                let iy1 = (max_y.ceil() as i32).min(h as i32 - 1) as usize;
-
-                // flip sign so edge funcs stay positive inside triangls
-                let sign = if area > 0.0 { -1.0 } else { 1.0 };
-                let inv_abs = 1.0 / abs_area;
-
-                let e01_dx = (p1[1] - p0[1]) * sign;
-                let e01_dy = (p0[0] - p1[0]) * sign;
-                let e12_dx = (p2[1] - p1[1]) * sign;
-                let e12_dy = (p1[0] - p2[0]) * sign;
-                let e20_dx = (p0[1] - p2[1]) * sign;
-                let e20_dy = (p2[0] - p0[0]) * sign;
-
-                let px_start = ix0 as f32 + 0.5;
-                let py_start = iy0 as f32 + 0.5;
-
-                let mut w0_row = (px_start - p1[0]) * e12_dx + (py_start - p1[1]) * e12_dy;
-                let mut w1_row = (px_start - p2[0]) * e20_dx + (py_start - p2[1]) * e20_dy;
-                let mut w2_row = (px_start - p0[0]) * e01_dx + (py_start - p0[1]) * e01_dy;
-                let span_len = ix1 - ix0 + 1;
-
-                if active_tex.is_some() || normal_tex.is_some() || !overlay_texs.is_empty() {
-                    let uv0 = mesh.uvs[i0];
-                    let uv1 = mesh.uvs[i1];
-                    let uv2 = mesh.uvs[i2];
-                    // tangent frame of the triangle in the lighting frame for normal mapping
-                    let tbn = normal_tex.and_then(|_| {
-                        let (q0, q1, q2) = (mesh.verts[i0], mesh.verts[i1], mesh.verts[i2]);
-                        let e1 = [q1[0] - q0[0], q1[1] - q0[1], q1[2] - q0[2]];
-                        let e2 = [q2[0] - q0[0], q2[1] - q0[1], q2[2] - q0[2]];
-                        let (du1, dv1, du2, dv2) = (uv1[0] - uv0[0], uv1[1] - uv0[1], uv2[0] - uv0[0], uv2[1] - uv0[1]);
-                        let det = du1 * dv2 - du2 * dv1;
-                        if det.abs() < 1e-12 {
-                            return None;
-                        }
-                        let unit = |a: [f32; 3]| {
-                            let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
-                            (l > 1e-12).then(|| [a[0] / l, a[1] / l, a[2] / l])
-                        };
-                        let t = unit(std::array::from_fn(|k| (e1[k] * dv2 - e2[k] * dv1) / det))?;
-                        let b = unit(std::array::from_fn(|k| (e2[k] * du1 - e1[k] * du2) / det))?;
-                        Some((to_view(t), to_view(b)))
-                    });
-                    let flat_rgb = [base_albedo[0] * 255.0, base_albedo[1] * 255.0, base_albedo[2] * 255.0];
-                    for y in iy0..=iy1 {
-                        let row_start = y * w + ix0;
-                        let z_row = &mut mesh.z_buf[row_start..row_start + span_len];
-                        let c_row = &mut mesh.color_buf[row_start..row_start + span_len];
-                        let (mut w0, mut w1, mut w2) = (w0_row, w1_row, w2_row);
-                        for x in 0..span_len {
-                            if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
-                                let (b0, b1, b2) = (w0 * inv_abs, w1 * inv_abs, w2 * inv_abs);
-                                let z = b0 * p0[2] + b1 * p1[2] + b2 * p2[2];
-                                if z + depth_bias > z_row[x] {
-                                    let u = b0 * uv0[0] + b1 * uv1[0] + b2 * uv2[0];
-                                    let v = b0 * uv0[1] + b1 * uv1[1] + b2 * uv2[1];
-                                    let tc = active_tex.map(|tex| tex.sample(u, v));
-                                    let alpha = match (pass, tc) {
-                                        (MaterialPass::Glass { .. }, None) | (MaterialPass::Glass { texture_alpha: false }, _) => GLASS_PREVIEW_ALPHA,
-                                        (MaterialPass::Opaque, _) | (_, None) => 255,
-                                        (MaterialPass::Cutout, Some(tc)) => if tc.a() >= 128 { 255 } else { 0 },
-                                        (_, Some(tc)) => tc.a(),
-                                    };
-                                    if alpha != 0 {
-                                        let mut rgb = match tc {
-                                            Some(tc) => {
-                                                let [r, g, b, _] = if pass != MaterialPass::Opaque && tc.a() != 255 {
-                                                    tc.to_srgba_unmultiplied()
-                                                } else {
-                                                    tc.to_array()
-                                                };
-                                                [r as f32, g as f32, b as f32]
-                                            }
-                                            None => flat_rgb,
-                                        };
-                                        for ov in overlay_texs {
-                                            let oc = ov.sample(u, v);
-                                            rgb[0] *= oc.r() as f32 / 255.0;
-                                            rgb[1] *= oc.g() as f32 / 255.0;
-                                            rgb[2] *= oc.b() as f32 / 255.0;
-                                        }
-                                        let (shade, ndl, rim_px) = match (normal_tex, tbn) {
-                                            (Some(nt), Some((tv, bv))) => {
-                                                let nc = nt.sample(u, v);
-                                                let (tx, ty, tz) = (nc.r() as f32 / 127.5 - 1.0, nc.g() as f32 / 127.5 - 1.0, (nc.b() as f32 / 127.5 - 1.0).max(0.05));
-                                                let nv: [f32; 3] = std::array::from_fn(|k| tv[k] * tx + bv[k] * ty + n_view[k] * tz);
-                                                let len = (nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]).sqrt().max(1e-6);
-                                                shade_of([nv[0] / len, nv[1] / len, nv[2] / len])
-                                            }
-                                            _ => ([shade_r, shade_g, shade_b], ndl1, rim),
-                                        };
-                                        let coat = if is_paint { (ndl.powi(24) * 0.55 + rim_px * 0.14) * 255.0 } else { 0.0 };
-                                        let src = Color32::from_rgb(
-                                            ((rgb[0] * shade[0] + coat).min(255.0)) as u8,
-                                            ((rgb[1] * shade[1] + coat).min(255.0)) as u8,
-                                            ((rgb[2] * shade[2] + coat).min(255.0)) as u8,
-                                        );
-                                        if blend {
-                                            blend_preview_pixel(&mut c_row[x], src, alpha);
-                                        } else {
-                                            z_row[x] = z;
-                                            c_row[x] = src;
-                                        }
-                                    }
-                                }
-                            }
-                            w0 += e12_dx;
-                            w1 += e20_dx;
-                            w2 += e01_dx;
-                        }
-                        w0_row += e12_dy;
-                        w1_row += e20_dy;
-                        w2_row += e01_dy;
-                    }
-                    continue;
-                }
-
-                for y in iy0..=iy1 {
-                    let row_start = y * w + ix0;
-                    let z_row = &mut mesh.z_buf[row_start..row_start + span_len];
-                    let c_row = &mut mesh.color_buf[row_start..row_start + span_len];
-                    let (mut w0, mut w1, mut w2) = (w0_row, w1_row, w2_row);
-                    for x in 0..span_len {
-                        if w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0 {
-                            let z = (w0 * p0[2] + w1 * p1[2] + w2 * p2[2]) * inv_abs;
-                            if z > z_row[x] {
-                                if glass {
-                                    blend_preview_pixel(&mut c_row[x], flat_col, GLASS_PREVIEW_ALPHA);
-                                } else {
-                                    z_row[x] = z;
-                                    c_row[x] = flat_col;
-                                }
-                            }
-                        }
-                        w0 += e12_dx;
-                        w1 += e20_dx;
-                        w2 += e01_dx;
-                    }
-                    w0_row += e12_dy;
-                    w1_row += e20_dy;
-                    w2_row += e01_dy;
-                }
-            }
-        }
-
-        if do_wire {
-            let wire_col = if do_solid { Color32::from_rgb(252, 175, 23) } else { Color32::from_rgb(72, 210, 255) };
-            let z_bias = if do_solid { mesh.radius * 0.004 } else { 0.0 };
-            let vis = mesh.visible_tris();
-            let step = (vis.len() / 25_000).max(1);
-            for t in mesh.tris[vis].iter().step_by(step) {
-                let p0 = mesh.proj_buf[t[0] as usize];
-                let p1 = mesh.proj_buf[t[1] as usize];
-                let p2 = mesh.proj_buf[t[2] as usize];
-                draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, p0, p1, wire_col, z_bias);
-                draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, p1, p2, wire_col, z_bias);
-                draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, p2, p0, wire_col, z_bias);
-            }
-        }
-    } else if !mesh.edges.is_empty() {
-        let col = Color32::from_rgb(72, 210, 255);
-        for &(a, b) in mesh.edges.iter().take(60_000) {
-            draw_line_z(&mut mesh.color_buf, &mut mesh.z_buf, w, h, mesh.proj_buf[a as usize], mesh.proj_buf[b as usize], col, 0.0);
-        }
-    } else {
-        let col = Color32::from_rgb(252, 175, 23);
-        for p0 in &mesh.proj_buf {
-            let xi = p0[0] as i32;
-            let yi = p0[1] as i32;
-            if xi >= 1 && yi >= 1 && (xi as usize) + 1 < w && (yi as usize) + 1 < h {
-                let idx = (yi as usize) * w + (xi as usize);
-                if p0[2] > mesh.z_buf[idx] {
-                    mesh.z_buf[idx] = p0[2];
-                    mesh.color_buf[idx] = col;
-                }
-            }
-        }
-    }
 }
 
 // dropdown that switches individual material textures of the mesh on and off
@@ -2033,6 +1842,15 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
                 mesh.dirty = true;
             }
         }
+        if !mesh.tris.is_empty()
+            && ui
+                .selectable_label(!mesh.flat_shading, "Smooth")
+                .on_hover_text("Smooth shading normals rebuilt from the mesh topology. Switch off to see the real facets.")
+                .clicked()
+        {
+            mesh.flat_shading = !mesh.flat_shading;
+            mesh.dirty = true;
+        }
         if ui.selectable_label(mesh.auto_spin, "Spin").clicked() {
             mesh.auto_spin = !mesh.auto_spin;
             mesh.dirty = true;
@@ -2042,11 +1860,12 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
                 if let Ok(img) = image::open(&tp) {
                     let rgba = img.to_rgba8();
                     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+                    // model textures keep straight alpha
                     let pixels: Vec<Color32> = rgba
-                        .chunks_exact(4)
-                        .map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
+                        .as_chunks::<4>().0.iter()
+                        .map(|c| Color32::from_rgba_premultiplied(c[0], c[1], c[2], c[3]))
                         .collect();
-                    mesh.texture = Some(Texture2D { w, h, pixels });
+                    mesh.texture = Some(Texture2D::new(w, h, pixels));
                     mesh.tex_status = format!("Loaded {} ({w}x{h})", tp.file_name().unwrap_or_default().to_string_lossy());
                     mesh.shade_mode = ShadeMode::Textured;
                     mesh.dirty = true;
@@ -2061,10 +1880,22 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
             mesh.pan_y = 0.0;
             mesh.dirty = true;
         }
-        if ui.button("Export .OBJ").clicked() {
+        if ui.button("Export .OBJ").on_hover_text("Wavefront OBJ with smooth normals, a material library and the applied textures as PNG").clicked() {
             let safe_name = mesh.name.replace('#', "");
             if let Some(p) = rfd::FileDialog::new().set_file_name(format!("{safe_name}.obj")).save_file() {
-                let _ = mesh.export_obj(&p);
+                if let Err(e) = mesh.export_obj_with_materials(&p) {
+                    mesh.tex_status = format!("OBJ export failed: {e}");
+                }
+            }
+        }
+        if !mesh.tris.is_empty()
+            && ui.button("Export .GLB").on_hover_text("Binary glTF 2.0 with normals, materials and embedded textures, ready for Blender or any engine").clicked()
+        {
+            let safe_name = mesh.name.replace('#', "");
+            if let Some(p) = rfd::FileDialog::new().add_filter("glTF binary", &["glb"]).set_file_name(format!("{safe_name}.glb")).save_file() {
+                if let Err(e) = mesh.export_glb(&p) {
+                    mesh.tex_status = format!("GLB export failed: {e}");
+                }
             }
         }
         tex_layer_menu(ui, mesh);
@@ -2095,6 +1926,26 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
                 mesh.dirty = true;
             }
         }
+        if mesh.has_els {
+            ui.add_space(4.0);
+            let label = if mesh.els_enabled { "ELS On" } else { "ELS Off" };
+            if ui
+                .selectable_label(mesh.els_enabled, label)
+                .on_hover_text(format!("Preview {} RAGE 9 siren-bone emitters.", mesh.els_points.len()))
+                .clicked()
+            {
+                mesh.els_enabled = !mesh.els_enabled;
+                mesh.shade_mode = ShadeMode::Textured;
+                mesh.dirty = true;
+            }
+            if ui
+                .add_enabled(mesh.els_enabled, egui::Checkbox::new(&mut mesh.els_flash, "Flash"))
+                .on_hover_text("Use the game-authored 32-step siren sequencers at 500 BPM.")
+                .changed()
+            {
+                mesh.dirty = true;
+            }
+        }
         ui.label(RichText::new(&mesh.tex_status).size(11.0).color(Color32::from_rgb(130, 145, 168)));
     });
     ui.add_space(4.0);
@@ -2102,19 +1953,20 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
     let avail = ui.available_size();
     let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
 
-    let mut dragging = false;
+    // moving frames trade resolution for speed the resting frame is supersampled
+    let mut moving = false;
     if resp.dragged_by(egui::PointerButton::Primary) {
         let d = resp.drag_delta();
         mesh.yaw += d.x * 0.01;
         mesh.pitch = (mesh.pitch + d.y * 0.01).clamp(-1.5, 1.5);
         mesh.dirty = true;
-        dragging = true;
+        moving = true;
     } else if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
         let d = resp.drag_delta();
         mesh.pan_x += d.x / rect.width().max(1.0);
         mesh.pan_y += d.y / rect.height().max(1.0);
         mesh.dirty = true;
-        dragging = true;
+        moving = true;
     }
     if resp.double_clicked() {
         mesh.yaw = DEFAULT_YAW;
@@ -2129,6 +1981,7 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
         if scroll != 0.0 {
             mesh.zoom = (mesh.zoom * (1.0 + scroll * 0.0022)).clamp(0.15, 25.0);
             mesh.dirty = true;
+            moving = true;
         }
         // codewalker-style wasd + q/e camera navigation
         let (fw, rt, up) = ui.input(|i| {
@@ -2142,34 +1995,61 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
             mesh.pan_x -= rt * 0.015;
             mesh.pan_y += up * 0.015;
             mesh.dirty = true;
+            moving = true;
             ui.ctx().request_repaint();
         }
     }
-    if mesh.auto_spin && !dragging {
+    if mesh.auto_spin && !moving {
         mesh.yaw += 0.014;
         mesh.dirty = true;
+        moving = true;
         ui.ctx().request_repaint();
     }
-    if mesh.last_dragging && !dragging {
+    if mesh.els_enabled && mesh.els_flash {
+        let steps_per_second = RAGE9_SIREN_BPM / 60.0 * (RAGE9_SIREN_MULTIPLES * 2) as f64;
+        let phase = (ui.input(|i| i.time) * steps_per_second) as u64;
+        if phase != mesh.els_flash_phase {
+            mesh.els_flash_phase = phase;
+            mesh.dirty = true;
+            // flashing redraws about 50 times a second so it renders at the adaptive moving resolution
+            moving = true;
+        }
+        ui.ctx().request_repaint();
+    } else if mesh.els_flash_phase != 0 {
+        mesh.els_flash_phase = 0;
         mesh.dirty = true;
     }
-    mesh.last_dragging = dragging;
 
-    let heavy = mesh.visible_tris().len() > 25_000;
     let ppp = ui.ctx().pixels_per_point();
-    let res_scale = ppp * if dragging && heavy { 0.55 } else { 1.0 };
-    let target_w = ((rect.width() * res_scale) as usize).clamp(160, 1920);
-    let target_h = ((rect.height() * res_scale) as usize).clamp(120, 1200);
+    let target_w = ((rect.width() * ppp) as usize).clamp(160, 1920);
+    let target_h = ((rect.height() * ppp) as usize).clamp(120, 1200);
+    let megasamples = (target_w * target_h) as f32 / 1.0e6;
+    let scale = if moving {
+        // largest scale whose predicted cost fits a 60 hz frame
+        if mesh.frame_cost > 0.0 { (MOVING_FRAME_MS / (mesh.frame_cost * megasamples)).sqrt().clamp(0.5, 1.5) } else { 1.0 }
+    } else {
+        raster::idle_supersampling(target_w, target_h)
+    };
 
-    if mesh.dirty || mesh.fb_w != target_w || mesh.fb_h != target_h || mesh.tex.is_none() {
-        rasterize_mesh(mesh, target_w, target_h);
-        let ci = ColorImage { size: [target_w, target_h], pixels: mesh.color_buf.clone() };
+    if mesh.dirty || mesh.view_size != (target_w, target_h) || mesh.tex.is_none() || (!moving && !mesh.view_refined) {
+        let started = std::time::Instant::now();
+        let (w, h, pixels) = raster::render_image(mesh, target_w, target_h, scale);
+        let ms = started.elapsed().as_secs_f32() * 1000.0;
+        let cost = ms / (megasamples * scale * scale).max(1e-3);
+        mesh.frame_cost = if mesh.frame_cost > 0.0 { mesh.frame_cost * 0.6 + cost * 0.4 } else { cost };
+        let ci = ColorImage { size: [w, h], pixels };
         if let Some(tex) = &mut mesh.tex {
             tex.set(ci, TextureOptions::LINEAR);
         } else {
             mesh.tex = Some(ui.ctx().load_texture("percystar_3d_fb", ci, TextureOptions::LINEAR));
         }
         mesh.dirty = false;
+        mesh.view_size = (target_w, target_h);
+        mesh.view_refined = !moving;
+        if moving {
+            // make sure a resting frame follows once input stops
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        }
     }
 
     let p = ui.painter_at(rect);
@@ -2189,6 +2069,66 @@ pub fn render_mesh3d_viewport(ui: &mut egui::Ui, mesh: &mut Mesh3D) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rage9_siren_uses_game_sequencers_and_sub_flashes() {
+        assert_eq!(rage9_siren_slot("siren1"), Some(1));
+        assert_eq!(rage9_siren_slot("ext_front_siren2"), Some(2));
+        assert_eq!(rage9_siren_slot("siren_bumper_r_bar4"), None);
+        assert_eq!(rage9_siren_slot("siren_roof_round_1"), None);
+        assert_eq!(rage9_siren_slot("siren_roof"), None);
+        // siren1 starts with 1, siren4 with the inverse 0.
+        assert!(rage9_siren_lit(1, 0));
+        assert!(!rage9_siren_lit(4, 0));
+        // Three flashes are emitted inside an active beat.
+        assert!(!rage9_siren_lit(1, 1));
+        assert!(rage9_siren_lit(1, 2));
+        assert!(rage9_siren_lit(1, 4));
+        // The next bit reverses the pair; unused and invalid slots stay dark.
+        assert!(!rage9_siren_lit(1, 6));
+        assert!(rage9_siren_lit(4, 6));
+        assert!(!rage9_siren_lit(9, 0));
+        assert!(!rage9_siren_lit(0, 0));
+        assert!(!rage9_siren_lit(21, 0));
+    }
+
+    #[test]
+    fn vehicle_parts_merge_in_parent_model_space() {
+        let mut base = Mesh3D::from_parts(
+            "car_hi".into(),
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![[0.0; 2]; 3],
+            vec![[0, 1, 2]],
+            vec![0],
+            vec![],
+            None,
+            String::new(),
+            1,
+            1,
+            "High".into(),
+        );
+        let mut lightbar = Mesh3D::from_parts(
+            "car_lightbar_hi".into(),
+            vec![[0.0, 0.0, 2.0], [1.0, 0.0, 2.0], [0.0, 1.0, 2.0]],
+            vec![[0.0; 2]; 3],
+            vec![[0, 1, 2]],
+            vec![0],
+            vec![],
+            None,
+            String::new(),
+            1,
+            1,
+            "High".into(),
+        );
+        lightbar.has_els = true;
+        lightbar.els_points.push(ElsPoint { position: [0.5, 0.5, 2.0], bank: false, slot: 1 });
+        base.append_vehicle_part(lightbar);
+        assert_eq!(base.verts.len(), 6);
+        assert_eq!(base.tris, vec![[0, 1, 2], [3, 4, 5]]);
+        assert_eq!(base.parts.len(), 2);
+        assert_eq!(base.els_points.len(), 1);
+        assert!(base.has_els);
+    }
 
     #[test]
     fn upright_and_not_mirrored() {
@@ -2218,12 +2158,12 @@ mod tests {
         m.pitch = 0.0;
         m.geom_materials = vec![
             GeomMaterial {
-                texture: Some(Arc::new(Texture2D { w: 1, h: 1, pixels: vec![Color32::TRANSPARENT] })),
+                texture: Some(Arc::new(Texture2D::new(1, 1, vec![Color32::TRANSPARENT]))),
                 pass: MaterialPass::Cutout,
                 ..Default::default()
             },
             GeomMaterial {
-                texture: Some(Arc::new(Texture2D { w: 1, h: 1, pixels: vec![Color32::GREEN] })),
+                texture: Some(Arc::new(Texture2D::new(1, 1, vec![Color32::GREEN]))),
                 ..Default::default()
             },
         ];
@@ -2253,7 +2193,7 @@ mod tests {
             ([0, 255, 0, 128], MaterialPass::Decal), ([0, 255, 0, 128], glass),
             ([255, 255, 255, 255], glass),
         ].into_iter().map(|([r, g, b, a], pass)| GeomMaterial {
-            texture: Some(Arc::new(Texture2D { w: 1, h: 1, pixels: vec![Color32::from_rgba_unmultiplied(r, g, b, a)] })),
+            texture: Some(Arc::new(Texture2D::new(1, 1, vec![Color32::from_rgba_premultiplied(r, g, b, a)]))),
             pass,
             ..Default::default()
         }).collect();
@@ -2282,6 +2222,370 @@ mod tests {
         assert_eq!(ext, ".#ft");
         assert!(is_vehicle_virtual(&buf, &nm));
         assert!(!is_vehicle_virtual(&buf, "test_vehicle_spoiler_01.#ft"));
+    }
+}
+
+#[cfg(test)]
+mod showcase_tests {
+    use super::*;
+
+    fn tex(w: usize, h: usize, px: Vec<Color32>) -> Texture2D {
+        Texture2D::new(w, h, px)
+    }
+
+    // appends a parametric surface as an indexed grid the way a gpu vertex buffer stores it
+    // positions uvs triangles and the geometry id of every triangle
+    type Soup = (Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<[u32; 3]>, Vec<u16>);
+
+    fn grid(m: &mut Soup, nu: u32, nv: u32, geom: u16, f: impl Fn(f32, f32) -> ([f32; 3], [f32; 2])) {
+        let base = m.0.len() as u32;
+        for j in 0..=nv {
+            for i in 0..=nu {
+                let (p, uv) = f(i as f32 / nu as f32, j as f32 / nv as f32);
+                m.0.push(p);
+                m.1.push(uv);
+            }
+        }
+        for j in 0..nv {
+            for i in 0..nu {
+                let a = base + j * (nu + 1) + i;
+                let b = a + nu + 1;
+                m.2.push([a, a + 1, b]);
+                m.2.push([a + 1, b + 1, b]);
+                m.3.extend([geom, geom]);
+            }
+        }
+    }
+
+    // sphere cylinder torus box ground and a glass pane with painted textured cutout and glass materials
+    pub(super) fn showcase() -> Mesh3D {
+        use std::f32::consts::{PI, TAU};
+        let mut m = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // geom 0 painted sphere
+        grid(&mut m, 28, 14, 0, |u, v| {
+            let (th, ph) = (u * TAU, v * PI);
+            ([-1.6 + ph.sin() * th.cos() * 0.8, ph.sin() * th.sin() * 0.8, 0.8 + ph.cos() * 0.8], [u, v])
+        });
+        // geom 1 textured torus
+        grid(&mut m, 40, 16, 1, |u, v| {
+            let (a, b) = (u * TAU, v * TAU);
+            let r = 0.75 + 0.28 * b.cos();
+            ([1.5 + r * a.cos(), r * a.sin(), 0.5 + 0.28 * b.sin()], [u * 6.0, v * 2.0])
+        });
+        // geom 2 low poly cylinder with a duplicated uv seam
+        grid(&mut m, 10, 1, 2, |u, v| {
+            let a = u * TAU;
+            ([0.45 * a.cos(), 1.7 + 0.45 * a.sin(), v * 1.4], [u * 3.0, v])
+        });
+        // geom 3 box with split vertices hard edges
+        for axis in 0..3 {
+            for sign in [-1.0f32, 1.0] {
+                grid(&mut m, 1, 1, 3, |u, v| {
+                    let mut p = [0.0f32; 3];
+                    p[axis] = sign * 0.5;
+                    p[(axis + 1) % 3] = (u - 0.5) * if sign > 0.0 { 1.0 } else { -1.0 };
+                    p[(axis + 2) % 3] = v - 0.5;
+                    ([p[0], p[1] - 1.9, p[2] + 0.5], [u, v])
+                });
+            }
+        }
+        // geom 4 ground with a fine texture that aliases when minified
+        grid(&mut m, 1, 1, 4, |u, v| ([(u - 0.5) * 6.4, (v - 0.5) * 5.6 - 0.1, 0.0], [u * 24.0, v * 24.0]));
+        // geom 5 cutout fence
+        grid(&mut m, 1, 1, 5, |u, v| ([-2.9 + u * 2.4, -1.2, v * 1.3], [u * 6.0, v * 3.0]));
+        // geom 6 glass pane in front of the torus
+        grid(&mut m, 1, 1, 6, |u, v| ([0.6 + u * 1.8, -1.35, 0.1 + v * 1.2], [u, v]));
+        let n_geoms = 7;
+        let mut mesh = Mesh3D::from_parts("showcase".into(), m.0, m.1, m.2, m.3, vec![], None, String::new(), n_geoms, 0, String::new());
+        mesh.normal_source = NormalSource::SharedVertices;
+        let checker = |n: usize, cell: usize, a: [u8; 3], b: [u8; 3]| {
+            tex(n, n, (0..n * n).map(|i| if ((i % n) / cell + (i / n) / cell).is_multiple_of(2) { Color32::from_rgb(a[0], a[1], a[2]) } else { Color32::from_rgb(b[0], b[1], b[2]) }).collect())
+        };
+        // round holes punched into an opaque sheet transparent texels are black like bc1
+        let fence = tex(64, 64, (0..64 * 64).map(|i| {
+            let (x, y) = ((i % 64) as f32 - 31.5, (i / 64) as f32 - 31.5);
+            if x * x + y * y < 22.0 * 22.0 { Color32::from_rgba_premultiplied(0, 0, 0, 0) } else { Color32::from_rgb(214, 196, 150) }
+        }).collect());
+        let mut mats = vec![GeomMaterial::default(); n_geoms];
+        mats[0].paint_capable = true;
+        mats[0].is_vehicle_paint = true;
+        mats[1].texture = Some(Arc::new(checker(256, 16, [228, 120, 40], [250, 236, 210])));
+        mats[2].texture = Some(Arc::new(checker(64, 8, [70, 130, 200], [225, 232, 240])));
+        mats[4].texture = Some(Arc::new(checker(256, 2, [56, 60, 68], [176, 180, 188])));
+        mats[5].texture = Some(Arc::new(fence));
+        mats[5].pass = MaterialPass::Cutout;
+        mats[6].pass = MaterialPass::Glass { texture_alpha: false };
+        mesh.geom_materials = mats;
+        mesh.has_paint_geom = true;
+        mesh.pitch = 0.42;
+        mesh.zoom = 1.45;
+        mesh
+    }
+
+    fn save(dir: &str, name: &str, w: usize, h: usize, px: &[Color32]) {
+        let _ = fs::create_dir_all(dir);
+        let rgba: Vec<u8> = px.iter().flat_map(|c| c.to_array()).collect();
+        image::save_buffer(Path::new(dir).join(name), &rgba, w as u32, h as u32, image::ColorType::Rgba8).expect("save png");
+    }
+
+    // set PERCYSTAR_RENDER_DIR to also write the frames as png
+    #[test]
+    fn showcase_renders_smooth_filtered_and_antialiased() {
+        let out = std::env::var("PERCYSTAR_RENDER_DIR").ok();
+        let mut m = showcase();
+        let (w, h) = (960usize, 600usize);
+        rasterize_mesh(&mut m, w, h);
+        let plain = m.color_buf.clone();
+        let started = std::time::Instant::now();
+        let (iw, ih, hq) = raster::render_image(&mut m, w, h, raster::idle_supersampling(w, h));
+        eprintln!("supersampled frame {:.1} ms", started.elapsed().as_secs_f32() * 1000.0);
+        assert_eq!((iw, ih), (w, h));
+        m.flat_shading = true;
+        rasterize_mesh(&mut m, w, h);
+        let flat = m.color_buf.clone();
+        m.flat_shading = false;
+        if let Some(d) = &out {
+            save(d, "showcase_smooth.png", w, h, &plain);
+            save(d, "showcase_supersampled.png", w, h, &hq);
+            save(d, "showcase_flat.png", w, h, &flat);
+            for (mode, name) in [(ShadeMode::Solid, "showcase_clay.png"), (ShadeMode::SolidWire, "showcase_wire.png")] {
+                m.shade_mode = mode;
+                let (_, _, px) = raster::render_image(&mut m, w, h, 2.0);
+                save(d, name, w, h, &px);
+            }
+            m.shade_mode = ShadeMode::Textured;
+        }
+        // every frame is fully covered no sample is left unshaded inside the ground quad
+        assert!(plain.iter().chain(&hq).chain(&flat).all(|c| c.a() == 255));
+        // smooth shading removes the facet steps so neighbouring pixels differ far less on the painted sphere
+        let roughness = |px: &[Color32]| {
+            let mut sum = 0u64;
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    let c = px[y * w + x];
+                    // second difference isolates steps from gradients
+                    let (l, r) = (px[y * w + x - 1], px[y * w + x + 1]);
+                    sum += (2 * c.g() as i32 - l.g() as i32 - r.g() as i32).unsigned_abs() as u64;
+                }
+            }
+            sum
+        };
+        let (rs, rf, rh) = (roughness(&plain), roughness(&flat), roughness(&hq));
+        eprintln!("roughness flat {rf} smooth {rs} supersampled {rh}");
+        assert!(rs < rf, "smooth shading must be smoother than facets");
+        assert!(rh < rs, "supersampling must reduce pixel scale aliasing");
+        // the same frame renders identically on every run regardless of thread scheduling
+        rasterize_mesh(&mut m, w, h);
+        assert!(m.color_buf == plain, "rendering must be deterministic");
+    }
+
+
+    // cargo test --release viewer_frame_times -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn viewer_frame_times() {
+        let mut m = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        // one million triangle textured sphere
+        grid(&mut m, 1000, 500, 0, |u, v| {
+            let (th, ph) = (u * std::f32::consts::TAU, v * std::f32::consts::PI);
+            ([ph.sin() * th.cos(), ph.sin() * th.sin(), ph.cos()], [u * 8.0, v * 4.0])
+        });
+        let mut dense = Mesh3D::from_parts("dense".into(), m.0, m.1, m.2, m.3, vec![], None, String::new(), 1, 0, String::new());
+        dense.normal_source = NormalSource::SharedVertices;
+        let px = (0..256 * 256).map(|i| if ((i % 256) / 16 + (i / 256) / 16) % 2 == 0 { Color32::from_rgb(230, 120, 40) } else { Color32::WHITE }).collect();
+        dense.geom_materials = vec![GeomMaterial { texture: Some(Arc::new(tex(256, 256, px))), ..Default::default() }];
+        let started = std::time::Instant::now();
+        let _ = dense.corner_normals();
+        eprintln!("normals for {} triangles {:.0} ms", dense.tris.len(), started.elapsed().as_secs_f32() * 1000.0);
+        for (name, mesh) in [("showcase", &mut showcase()), ("1M tris", &mut dense)] {
+            for (w, h) in [(1280usize, 720usize), (1920, 1200)] {
+                for scale in [1.0, raster::idle_supersampling(w, h)] {
+                    let _ = raster::render_image(mesh, w, h, scale);
+                    let started = std::time::Instant::now();
+                    for _ in 0..3 {
+                        mesh.yaw += 0.05;
+                        let _ = raster::render_image(mesh, w, h, scale);
+                    }
+                    eprintln!("{name} {w}x{h} scale {scale:.2}: {:.1} ms", started.elapsed().as_secs_f32() * 1000.0 / 3.0);
+                }
+            }
+        }
+    }
+
+    // drives the real viewport code through egui without a window
+    #[test]
+    fn viewport_renders_moving_frames_and_refines_at_rest() {
+        let ctx = egui::Context::default();
+        let mut mesh = showcase();
+        let frame = |mesh: &mut Mesh3D, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 640.0))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| render_mesh3d_viewport(ui, mesh));
+            });
+        };
+        frame(&mut mesh, vec![]);
+        assert!(mesh.tex.is_some() && mesh.view_refined && !mesh.dirty, "first frame is a resting frame");
+        let (w, h) = mesh.view_size;
+        assert!(w >= 160 && h >= 120 && mesh.frame_cost > 0.0);
+        // resting frames are supersampled the texture on screen has the viewport size
+        assert_eq!(mesh.tex.as_ref().unwrap().size(), [w, h]);
+        assert!(mesh.fb_w > w && mesh.fb_h > h, "resting frame renders more samples than pixels");
+
+        // nothing changed nothing is rendered again
+        let before = mesh.frame_cost;
+        frame(&mut mesh, vec![]);
+        assert_eq!(mesh.frame_cost, before);
+
+        // spinning renders moving frames at an adaptive resolution
+        mesh.auto_spin = true;
+        let yaw = mesh.yaw;
+        frame(&mut mesh, vec![]);
+        assert!(mesh.yaw != yaw && !mesh.view_refined);
+        let moving = (mesh.fb_w, mesh.fb_h);
+        assert!(moving.0 * 2 >= w && moving.0 * 2 <= w * 3, "moving scale stays between one half and one and a half: {moving:?} for {w}x{h}");
+
+        // once motion stops the next frame is refined again
+        mesh.auto_spin = false;
+        frame(&mut mesh, vec![]);
+        assert!(mesh.view_refined && mesh.fb_w > w);
+
+        // dragging orbits the camera
+        let at = egui::pos2(450.0, 400.0);
+        let press = egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() };
+        frame(&mut mesh, vec![egui::Event::PointerMoved(at), press]);
+        let yaw = mesh.yaw;
+        frame(&mut mesh, vec![egui::Event::PointerMoved(at + egui::vec2(60.0, 0.0))]);
+        frame(&mut mesh, vec![egui::Event::PointerMoved(at + egui::vec2(120.0, 10.0))]);
+        assert!(mesh.yaw > yaw, "drag must orbit: {} -> {}", yaw, mesh.yaw);
+        assert!(!mesh.view_refined, "a dragged frame is a moving frame");
+
+        // switching shading modes marks the frame dirty and renders without panicking in every mode
+        for mode in [ShadeMode::Solid, ShadeMode::SolidWire, ShadeMode::Wireframe, ShadeMode::Textured] {
+            mesh.shade_mode = mode;
+            mesh.flat_shading = mode == ShadeMode::Solid;
+            mesh.dirty = true;
+            frame(&mut mesh, vec![]);
+        }
+    }
+
+    // siren emitters glow over the frame flash with the sequencer and hide behind nearer geometry
+    #[test]
+    fn siren_glow_flashes_and_respects_depth() {
+        let mut m = showcase();
+        m.yaw = 0.0;
+        m.pitch = 0.0;
+        // one emitter in the open above the ground and one inside the opaque box
+        m.els_points = vec![
+            ElsPoint { position: [0.0, 0.0, 2.2], bank: false, slot: 1 },
+            ElsPoint { position: [0.0, -1.9, 0.5], bank: true, slot: 4 },
+        ];
+        m.has_els = true;
+        rasterize_mesh(&mut m, 400, 300);
+        let off = m.color_buf.clone();
+        m.els_enabled = true;
+        m.els_flash = false;
+        rasterize_mesh(&mut m, 400, 300);
+        let on = m.color_buf.clone();
+        let red_gain: i64 = on.iter().zip(&off).map(|(a, b)| a.r() as i64 - b.r() as i64).sum();
+        let blue_gain: i64 = on.iter().zip(&off).map(|(a, b)| a.b() as i64 - b.b() as i64).sum();
+        assert!(red_gain > 2000, "the visible red emitter glows: {red_gain}");
+        assert!(blue_gain < red_gain / 4, "the blue emitter inside the box stays hidden: {blue_gain}");
+        // flashing at a phase where slot 1 is dark draws nothing
+        m.els_flash = true;
+        m.els_flash_phase = 1;
+        rasterize_mesh(&mut m, 400, 300);
+        assert!(m.color_buf == off, "a dark sequencer step adds no glow");
+    }
+
+    // shared edges are drawn exactly once so glass does not double blend along its diagonal
+    #[test]
+    fn shared_edges_are_watertight_and_never_double_blended() {
+        for (yaw, pitch) in [(2.45, 0.38), (0.3, 0.1), (1.1, 0.9), (4.0, -0.2), (5.5, 0.6)] {
+            // every covered sample of a quad must belong to exactly one of its two triangles
+            let mut solo = Mesh3D::from_parts(
+                "quad".into(), vec![[-1.0, 0.0, -1.0], [1.0, 0.0, -1.0], [1.0, 0.3, 1.0], [-1.0, 0.3, 1.0]], vec![[0.0; 2]; 4],
+                vec![[0, 1, 2], [0, 2, 3]], vec![0, 0], vec![], None, String::new(), 1, 0, String::new(),
+            );
+            solo.yaw = yaw;
+            solo.pitch = pitch;
+            // exact check on coverage using the id buffer of an opaque version
+            rasterize_mesh(&mut solo, 300, 200);
+            let covered = solo.id_buf.iter().filter(|&&i| i != u32::MAX).count();
+            let mut a = solo.clone();
+            a.tris.truncate(1);
+            a.tri_geom.truncate(1);
+            a.normals.truncate(1);
+            a.invalidate_normals();
+            rasterize_mesh(&mut a, 300, 200);
+            let mut b = solo.clone();
+            b.tris.remove(0);
+            b.tri_geom.remove(0);
+            b.normals.remove(0);
+            b.invalidate_normals();
+            rasterize_mesh(&mut b, 300, 200);
+            let (ca, cb) = (a.id_buf.iter().filter(|&&i| i != u32::MAX).count(), b.id_buf.iter().filter(|&&i| i != u32::MAX).count());
+            assert_eq!(ca + cb, covered, "yaw {yaw} pitch {pitch}: the two triangles of a quad must tile it without gap or overlap");
+            let overlap = a.id_buf.iter().zip(&b.id_buf).filter(|(x, y)| **x != u32::MAX && **y != u32::MAX).count();
+            assert_eq!(overlap, 0, "yaw {yaw} pitch {pitch}: shared edge samples drawn twice");
+        }
+    }
+
+    // sub pixel triangles must still cover the surface instead of leaving background holes
+    #[test]
+    fn dense_meshes_have_no_pinholes() {
+        let mut m = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        grid(&mut m, 700, 700, 0, |u, v| ([(u - 0.5) * 2.0, 0.0, (v - 0.5) * 2.0], [u, v]));
+        let mut mesh = Mesh3D::from_parts("dense".into(), m.0, m.1, m.2, m.3, vec![], None, String::new(), 1, 0, String::new());
+        mesh.yaw = 0.0;
+        mesh.pitch = 0.0;
+        mesh.zoom = 0.5;
+        rasterize_mesh(&mut mesh, 400, 400);
+        let ids = &mesh.id_buf;
+        let inside: Vec<usize> = (0..400 * 400).filter(|&i| ids[i] != u32::MAX).collect();
+        let (x0, x1) = (inside.iter().map(|i| i % 400).min().unwrap(), inside.iter().map(|i| i % 400).max().unwrap());
+        let (y0, y1) = (inside.iter().map(|i| i / 400).min().unwrap(), inside.iter().map(|i| i / 400).max().unwrap());
+        // 980 thousand triangles on a square of about 124 pixels the square must be solid
+        assert!((x1 - x0) > 100 && (y1 - y0) > 100);
+        let holes = (y0 + 2..y1 - 1).flat_map(|y| (x0 + 2..x1 - 1).map(move |x| y * 400 + x)).filter(|&i| ids[i] == u32::MAX).count();
+        assert_eq!(holes, 0, "background shows through a dense mesh");
+    }
+
+    // a texture mapped onto a receding plane must follow perspective not screen space
+    #[test]
+    fn texture_mapping_is_perspective_correct() {
+        // one big quad from near to far split along the diagonal the two halves of the texture are black and white
+        let verts = vec![[-1.0, -3.0, 0.0], [1.0, -3.0, 0.0], [1.0, 3.0, 0.0], [-1.0, 3.0, 0.0]];
+        let uvs = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        let mut m = Mesh3D::from_parts("plane".into(), verts, uvs, vec![[0, 1, 2], [0, 2, 3]], vec![0, 0], vec![], None, String::new(), 1, 0, String::new());
+        m.yaw = 0.0;
+        m.pitch = 0.5;
+        // v below one half is red above is blue
+        let t = tex(1, 64, (0..64).map(|i| if i < 32 { Color32::from_rgb(255, 0, 0) } else { Color32::from_rgb(0, 0, 255) }).collect());
+        m.geom_materials = vec![GeomMaterial { texture: Some(Arc::new(t)), ..Default::default() }];
+        rasterize_mesh(&mut m, 400, 400);
+        // world midpoint of the quad y 0 projects to this screen row the color change must sit there
+        let mid_row = (m.proj_buf[0][1] + m.proj_buf[2][1]) * 0.5;
+        let true_mid = {
+            // project the world space center exactly like the renderer
+            let mut probe = Mesh3D::from_parts("p".into(), vec![[0.0, 0.0, 0.0], [-1.0, -3.0, 0.0], [1.0, 3.0, 0.0]], vec![], vec![], vec![], vec![], None, String::new(), 1, 0, String::new());
+            probe.center = m.center;
+            probe.radius = m.radius;
+            probe.yaw = 0.0;
+            probe.pitch = 0.5;
+            rasterize_mesh(&mut probe, 400, 400);
+            probe.proj_buf[0][1]
+        };
+        assert!((mid_row - true_mid).abs() > 6.0, "the test needs visible foreshortening");
+        let x = 200;
+        let switch = (1..399).find(|&y| {
+            let (a, b) = (m.color_buf[(y - 1) * 400 + x], m.color_buf[y * 400 + x]);
+            a.b() > a.r() && b.r() > b.b()
+        }).expect("blue far half above red near half") as f32;
+        assert!((switch - true_mid).abs() <= 1.5, "texture seam at row {switch} but the surface midpoint is at {true_mid} affine would give {mid_row}");
     }
 }
 
@@ -2396,7 +2700,7 @@ mod dictionary_decode_tests {
         let default_textured = textured(&m);
         assert_eq!(default_textured, 19, "default look keeps the 19 textured materials");
         assert!(m.geom_materials.iter().all(|g| g.normal.is_none() && g.overlays.is_empty()));
-        let mut shot = |m: &mut Mesh3D, tag: &str| {
+        let shot = |m: &mut Mesh3D, tag: &str| {
             rasterize_mesh(m, 800, 600);
             if let Some(d) = &out_dir {
                 let _ = fs::create_dir_all(d);
@@ -2467,6 +2771,29 @@ mod dictionary_decode_tests {
         }
     }
 
+    #[test]
+    fn vehicle_option_fragments_compose() {
+        let Ok(rpf) = std::env::var("PERCYSTAR_LEVELS_RPF") else { return };
+        if !Path::new(&rpf).exists() {
+            return;
+        }
+        let mut car = decode_rage9_model_from_rpf(Path::new(&rpf), 73_817_919_504, "stanierg2_hi")
+            .expect("decode base vehicle");
+        let option = decode_rage9_model_from_rpf(Path::new(&rpf), 73_831_055_376, "stanierg2_siren_roofbar1_mount_01_hi")
+            .expect("decode separate roofbar mount");
+        let (verts, tris) = (car.verts.len(), car.tris.len());
+        car.append_vehicle_part(option);
+        assert!(car.verts.len() > verts && car.tris.len() > tris);
+        assert!(car.parts.iter().any(|p| p.name.contains("siren_roofbar")));
+        assert!(!car.has_els, "a mount point is not itself an emergency light");
+
+        let roofbar = decode_rage9_model_from_rpf(Path::new(&rpf), 74_963_226_640, "cmn_siren_roofbar1_02_hi")
+            .expect("decode shared roofbar");
+        car.append_vehicle_part(roofbar);
+        assert!(car.has_els && car.els_points.len() >= 12);
+        assert!(car.els_points.iter().all(|p| p.position[2] > 0.7), "roofbar emitters attach at the vehicle mount");
+    }
+
     // external ttpf material resolution on vehicle paint and world slod
     #[test]
     fn ttpf_vehicle_and_world_materials() {
@@ -2477,6 +2804,8 @@ mod dictionary_decode_tests {
         let cases = [
             ("cheetah2", 74_051_276_816u64),
             ("cheetah2_hi", 74_053_521_424u64),
+            ("ambulance_hi", 71_757_271_056u64),
+            ("firetruk2_hi", 74_492_911_632u64),
             ("brickell_slod", 8_679_358_480u64),
         ];
         let out_dir = std::env::var("PERCYSTAR_RENDER_DIR").ok();
@@ -2491,10 +2820,18 @@ mod dictionary_decode_tests {
             if tag.starts_with("cheetah2") {
                 assert!(tex_mats > 0, "{tag} should resolve external TTPF textures");
                 assert!(paint_mats > 0 && m.has_paint_geom, "{tag} should detect vehicle paint geoms");
+            } else if tag == "ambulance_hi" {
+                assert_eq!(m.els_points.len(), 37, "ambulance should expose its siren1..37 bones");
+            } else if tag == "firetruk2_hi" {
+                assert!(!m.els_points.is_empty(), "firetruck should expose prefixed siren bones");
             } else {
                 assert!(tex_mats > 0, "{tag} should resolve external TTPF textures");
             }
             if let Some(ref d) = out_dir {
+                if m.has_els {
+                    m.els_enabled = true;
+                    m.els_flash = false;
+                }
                 rasterize_mesh(&mut m, 800, 600);
                 let mut rgba = Vec::with_capacity(800 * 600 * 4);
                 for c in &m.color_buf {
