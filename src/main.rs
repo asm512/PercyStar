@@ -2,6 +2,7 @@
 mod audio_player;
 mod awc;
 mod bink2;
+mod bink2_container;
 mod boot;
 mod dat;
 mod dxbc;
@@ -16,6 +17,7 @@ mod model3d;
 mod rdna2;
 mod tex;
 mod vehicle_variations;
+mod bench;
 use std::collections::HashSet;
 use model3d::{
     Mesh3D, decode_rage9_model_from_rpf, decode_rage9_model_from_rpf_lod, extract_0drpz_mesh, extract_rage9_model_name,
@@ -41,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -557,6 +560,8 @@ struct ScanState {
 #[derive(Default)]
 struct MediaState {
     loading: bool,
+    // bumped whenever the selection changes so a decode that finishes late is dropped
+    job: u64,
     status: String,
     loaded_tracks: Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>,
     loaded_bank_ctx: Option<audio_player::AudioBankContext>,
@@ -846,6 +851,8 @@ struct Rpf9App {
     tex_from_model: bool,
     // camera yaw pitch zoom pan carried across a lod switch
     lod_keep_cam: Option<[f32; 5]>,
+    export_busy: Arc<AtomicBool>,
+    export_cancel: Arc<AtomicBool>,
     mv_drawer_open: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
     mv_counts: [usize; 10],
@@ -1036,6 +1043,8 @@ impl Rpf9App {
             tex_pick: false,
             tex_from_model: false,
             lod_keep_cam: None,
+            export_busy: Arc::new(AtomicBool::new(false)),
+            export_cancel: Arc::new(AtomicBool::new(false)),
             mv_drawer_open: true,
             mv_entries: Vec::new(),
             mv_counts: [0; 10],
@@ -1156,6 +1165,7 @@ impl Rpf9App {
         self.audio_player.clear_all();
         self.stop_bink_player();
         let mut m = self.media.lock().unwrap();
+        m.job += 1;
         m.loaded_tracks = None;
         m.status.clear();
         m.loading = false;
@@ -1472,7 +1482,7 @@ impl Rpf9App {
                                     let mut c = cache_arc.lock().unwrap();
                                     c.insert(key.clone(), new_entries);
                                     let mut ls = last_save.lock().unwrap();
-                                    if ls.elapsed() > Duration::from_secs(5) {
+                                    if ls.elapsed() > Duration::from_secs(45) {
                                         save_disk_cache(&c);
                                         *ls = Instant::now();
                                     }
@@ -1760,35 +1770,30 @@ impl Rpf9App {
     }
 
     fn spawn_model_decode(&self, e: &RpfEntry, lod: usize) {
-        let media = Arc::clone(&self.media);
-        {
-            let mut m = media.lock().unwrap();
-            m.loading = true;
-            m.status = format!("Decoding RAGE9 meshlets: {}...", e.name);
-        }
         let src = e.source_rpf.clone();
         let off = e.offset;
         let nm = e.name.clone();
-        std::thread::spawn(move || {
-            match decode_rage9_model_from_rpf_lod(&src, off, &nm, lod) {
-                Ok(mut mesh) => {
-                    // the viewer also applies normal maps unless the model binds an unusually large set
-                    let normals = mesh.tex_layers.iter().filter(|l| l.kind == model3d::TexLayerKind::Normal).count();
-                    if (1..=64).contains(&normals) {
-                        mesh.set_tex_layers(|l| l.default_on || l.kind == model3d::TexLayerKind::Normal);
-                    }
-                    let mut m = media.lock().unwrap();
-                    m.loading = false;
+        spawn_media_job(
+            &self.media,
+            format!("Decoding RAGE9 meshlets: {}...", e.name),
+            true,
+            move |_| {
+                let mut mesh = decode_rage9_model_from_rpf_lod(&src, off, &nm, lod).map_err(|err| format!("Model decode error ({nm}): {err}"))?;
+                // the viewer also applies normal maps unless the model binds an unusually large set
+                let normals = mesh.tex_layers.iter().filter(|l| l.kind == model3d::TexLayerKind::Normal).count();
+                if (1..=64).contains(&normals) {
+                    mesh.set_tex_layers(|l| l.default_on || l.kind == model3d::TexLayerKind::Normal);
+                }
+                Ok(mesh)
+            },
+            |m, res| match res {
+                Ok(mesh) => {
                     m.status.clear();
                     m.loaded_mesh = Some(mesh);
                 }
-                Err(err) => {
-                    let mut m = media.lock().unwrap();
-                    m.loading = false;
-                    m.status = format!("Model decode error ({nm}): {err}");
-                }
-            }
-        });
+                Err(err) => m.status = err,
+            },
+        );
     }
 
     fn vehicle_parts_ui(&mut self, ui: &mut egui::Ui) {
@@ -2097,19 +2102,18 @@ impl Rpf9App {
     // lists and decodes every pooled texture the selected model binds in its shaders
     fn load_model_textures(&mut self) {
         let Some(e) = self.model_entry.and_then(|i| self.state.lock().unwrap().entries.get(i).cloned()) else { return };
-        let media = Arc::clone(&self.media);
-        {
-            let mut m = media.lock().unwrap();
-            m.loading = true;
-            m.status = format!("Resolving textures of {}...", e.name);
-        }
-        std::thread::spawn(move || {
-            let res = model3d::list_model_texture_refs(&e.source_rpf, e.offset).and_then(|refs| {
+        let name = e.name.clone();
+        spawn_media_job(
+            &self.media,
+            format!("Resolving textures of {}...", e.name),
+            false,
+            move |progress| {
+                let refs = model3d::list_model_texture_refs(&e.source_rpf, e.offset)?;
                 let total = refs.len();
                 let pooled: Vec<_> = refs.iter().filter(|r| r.hit.is_some()).collect();
                 let mut texs = Vec::with_capacity(pooled.len());
                 for (i, r) in pooled.iter().enumerate() {
-                    media.lock().unwrap().status = format!("Decoding textures of {} ({}/{})...", e.name, i + 1, pooled.len());
+                    progress(format!("Decoding textures of {} ({}/{})...", e.name, i + 1, pooled.len()));
                     let Some(hit) = &r.hit else { continue };
                     if let Ok(mut t) = decode_ttpf_texture(&hit.path, hit.tex_idx) {
                         let pool = hit.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -2127,17 +2131,15 @@ impl Rpf9App {
                     total - pooled.len()
                 );
                 Ok((texs, note))
-            });
-            let mut m = media.lock().unwrap();
-            m.loading = false;
-            match res {
+            },
+            move |m, res| match res {
                 Ok(v) => {
                     m.status.clear();
                     m.loaded_model_textures = Some(v);
                 }
-                Err(err) => m.status = format!("Model textures ({}): {err}", e.name),
-            }
-        });
+                Err(err) => m.status = format!("Model textures ({name}): {err}"),
+            },
+        );
     }
 
     // switches the viewed model to another detail file or in file lod level keeping the camera
@@ -2175,86 +2177,51 @@ impl Rpf9App {
         }
 
         if e.kind == "NAVM" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Decoding CNavMesh tile: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let off = e.offset;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_navmesh_from_rpf(&src, off, &nm) {
+            let (src, off, nm) = (e.source_rpf.clone(), e.offset, e.name.clone());
+            spawn_media_job(
+                &self.media,
+                format!("Decoding CNavMesh tile: {}...", e.name),
+                true,
+                move |_| decode_navmesh_from_rpf(&src, off, &nm).map_err(|err| format!("NavMesh decode error ({nm}): {err}")),
+                |m, res| match res {
                     Ok(mesh) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
                         m.status.clear();
                         m.loaded_mesh = Some(mesh);
                     }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("NavMesh decode error ({nm}): {err}");
-                    }
-                }
-            });
+                    Err(err) => m.status = err,
+                },
+            );
             return;
         }
 
-        if e.kind == "TXD" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Deswizzling Xbox Scarlett TXD: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let off = e.offset;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_txd_from_rpf(&src, off) {
+        if e.kind == "TXD" || e.kind == "TTPF" {
+            let (src, off, nm) = (e.source_rpf.clone(), e.offset, e.name.clone());
+            let tidx = e.tracks as usize;
+            let is_txd = e.kind == "TXD";
+            let status = if is_txd {
+                format!("Deswizzling Xbox Scarlett TXD: {}...", e.name)
+            } else {
+                format!("Decoding RDS5/ETPF texture: {}...", e.name)
+            };
+            spawn_media_job(
+                &self.media,
+                status,
+                true,
+                move |_| {
+                    if is_txd {
+                        decode_txd_from_rpf(&src, off).map_err(|err| format!("TXD decode error ({nm}): {err}"))
+                    } else {
+                        decode_ttpf_texture(&src, tidx).map(|t| vec![t]).map_err(|err| format!("TTPF decode error ({nm}): {err}"))
+                    }
+                },
+                |m, res| match res {
                     Ok(texs) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
                         m.status.clear();
                         m.loaded_textures = Some(texs);
                     }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("TXD decode error ({nm}): {err}");
-                    }
-                }
-            });
-            return;
-        }
-
-        if e.kind == "TTPF" {
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.status = format!("Decoding RDS5/ETPF texture: {}...", e.name);
-            }
-            let src = e.source_rpf.clone();
-            let tidx = e.tracks as usize;
-            let nm = e.name.clone();
-            std::thread::spawn(move || {
-                match decode_ttpf_texture(&src, tidx) {
-                    Ok(tex) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status.clear();
-                        m.loaded_textures = Some(vec![tex]);
-                    }
-                    Err(err) => {
-                        let mut m = media.lock().unwrap();
-                        m.loading = false;
-                        m.status = format!("TTPF decode error ({nm}): {err}");
-                    }
-                }
-            });
+                    Err(err) => m.status = err,
+                },
+            );
             return;
         }
 
@@ -2316,14 +2283,23 @@ impl Rpf9App {
             } else {
                 None
             };
-            let media = Arc::clone(&self.media);
-            {
-                let mut m = media.lock().unwrap();
-                m.loading = true;
-                m.loaded_bank_ctx = bank_ctx;
-                m.status = format!("Decoding {} Opus streams...", e.name);
-            }
-            std::thread::spawn(move || decode_awc_for_player(&e, &media));
+            self.media.lock().unwrap().loaded_bank_ctx = bank_ctx;
+            spawn_media_job(
+                &self.media,
+                format!("Decoding {} Opus streams...", e.name),
+                true,
+                move |progress| Ok::<_, String>(decode_awc_for_player(&e, progress)),
+                |m, res| match res {
+                    Ok((status, tracks)) => {
+                        m.status = status;
+                        m.loaded_tracks = tracks;
+                    }
+                    Err(err) => {
+                        m.status = format!("Decoded 0 playable .wav stream(s) natively — {err}");
+                        m.loaded_tracks = None;
+                    }
+                },
+            );
         } else {
             match read_entry_bytes(&e) {
                 Ok(data) => {
@@ -2403,7 +2379,7 @@ impl Rpf9App {
     fn rebuild_view(&mut self, key: (u64, String, Category, String, bool, bool)) {
         let st = self.state.lock().unwrap();
         if self.hay_ver != st.ver || self.hay_audio_named != self.audio_named {
-            self.hay = st.entries.iter().map(|e| format!("{}|{}|{}|{}", e.name, display_entry_name(e, false), e.rpf_name, e.kind).to_lowercase()).collect();
+            self.hay = build_hay(&st.entries);
             self.cached_rpf_names = st.rpf_names.clone();
             self.hay_ver = st.ver;
             self.hay_audio_named = self.audio_named;
@@ -2429,15 +2405,13 @@ impl Rpf9App {
         let (inc, exc): (Vec<&str>, Vec<&str>) = q.split_whitespace().partition(|t| !t.starts_with('-'));
         let exc: Vec<&str> = exc.iter().map(|t| &t[1..]).filter(|t| !t.is_empty()).collect();
         let all_rpf = self.selected_rpf == "All RPFs";
-        let mut view: Vec<usize> = st
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(i, e)| {
-                let cat_ok = match self.category {
+        let (entries, hay, category, vehicles_only, selected_rpf) = (&st.entries, &self.hay, &self.category, self.vehicles_only, &self.selected_rpf);
+        let mut view: Vec<usize> = par_filter(entries.len().min(hay.len()), |i| {
+                let e = &entries[i];
+                let cat_ok = match category {
                     Category::All => true,
                     Category::Vehicles => e.kind == "VEH",
-                    Category::Models => e.kind == "VEH" || (!self.vehicles_only && e.kind == "MODEL"),
+                    Category::Models => e.kind == "VEH" || (!vehicles_only && e.kind == "MODEL"),
                     Category::Textures => e.kind == "TXD" || e.kind == "TTPF" || e.kind == "HMAP",
                     Category::Ui => e.kind == "RBF0" || e.kind == "GFX" || e.kind == "GXT",
                     Category::NavMesh => e.kind == "NAVM",
@@ -2447,23 +2421,21 @@ impl Rpf9App {
                     Category::Resources => matches!(e.kind, "PSIN" | "ANIM" | "RSC9" | "META7A"),
                     Category::Binary => e.kind == "ZLIB",
                 };
-                let h = &self.hay[*i];
+                let h = &hay[i];
                 cat_ok
-                    && (all_rpf || e.rpf_name == self.selected_rpf)
+                    && (all_rpf || e.rpf_name == *selected_rpf)
                     && inc.iter().all(|t| h.contains(t))
                     && !exc.iter().any(|t| h.contains(t))
-            })
-            .map(|(i, _)| i)
-            .collect();
+            });
         match self.sort_mode {
             SortMode::Relevance => {
                 if let Some(first) = inc.first() {
-                    view.sort_by_key(|&i| (!self.hay[i].starts_with(first), self.hay[i].len()));
+                    view.sort_unstable_by_key(|&i| (!self.hay[i].starts_with(first), self.hay[i].len(), i));
                 }
             }
-            SortMode::SizeDesc => view.sort_by_key(|&i| std::cmp::Reverse(st.entries[i].raw_size)),
-            SortMode::SizeAsc => view.sort_by_key(|&i| st.entries[i].raw_size),
-            SortMode::Name => view.sort_by(|&a, &b| self.hay[a].cmp(&self.hay[b])),
+            SortMode::SizeDesc => view.sort_unstable_by_key(|&i| (std::cmp::Reverse(st.entries[i].raw_size), i)),
+            SortMode::SizeAsc => view.sort_unstable_by_key(|&i| (st.entries[i].raw_size, i)),
+            SortMode::Name => view.sort_unstable_by(|&a, &b| self.hay[a].cmp(&self.hay[b]).then(a.cmp(&b))),
         }
         drop(st);
         self.view = view;
@@ -2500,21 +2472,18 @@ impl Rpf9App {
         let ver = self.state.lock().unwrap().ver;
         if self.mv_ver != ver {
             let st = self.state.lock().unwrap();
-            let mut entries = Vec::new();
             let mut counts = [0usize; 10];
-            let mut video_count = 0usize;
-            for (idx, e) in st.entries.iter().enumerate() {
-                if !matches!(e.kind, "MODEL" | "VEH" | "NAVM") {
-                    video_count += usize::from(e.kind == "BK2");
-                    continue;
-                }
-                let cat = classify_model_cat(e.kind, &e.name);
-                if cat != ModelCat::NavMesh {
+            let video_count = st.entries.iter().filter(|e| e.kind == "BK2").count();
+            let models = par_filter(st.entries.len(), |i| matches!(st.entries[i].kind, "MODEL" | "VEH" | "NAVM"));
+            let entries: Vec<(usize, ModelCat, String)> = par_map(&models, |&idx| {
+                let e = &st.entries[idx];
+                (idx, classify_model_cat(e.kind, &e.name), format!("{}|{}", e.name, e.rpf_name).to_ascii_lowercase())
+            });
+            for (_, cat, _) in &entries {
+                if *cat != ModelCat::NavMesh {
                     counts[0] += 1;
                 }
-                counts[model_cat_idx(cat)] += 1;
-                let hay = format!("{}|{}", e.name, e.rpf_name).to_ascii_lowercase();
-                entries.push((idx, cat, hay));
+                counts[model_cat_idx(*cat)] += 1;
             }
             drop(st);
             self.mv_entries = entries;
@@ -2533,17 +2502,15 @@ impl Rpf9App {
         let q = key.2.to_ascii_lowercase();
         let (inc, exc): (Vec<&str>, Vec<&str>) = q.split_whitespace().partition(|t| !t.starts_with('-'));
         let exc: Vec<&str> = exc.iter().map(|t| &t[1..]).filter(|t| !t.is_empty()).collect();
-        let mut view: Vec<usize> = self
-            .mv_entries
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, cat, hay))| {
-                let cat_ok = match self.mv_cat {
+        let (mv_entries, mv_cat, hide_lods) = (&self.mv_entries, self.mv_cat, self.mv_hide_lods);
+        let mut view: Vec<usize> = par_filter(mv_entries.len(), |i| {
+                let (_, cat, hay) = &mv_entries[i];
+                let cat_ok = match mv_cat {
                     ModelCat::All => *cat != ModelCat::NavMesh,
                     other => *cat == other,
                 };
-                let lod_ok = !self.mv_hide_lods
-                    || self.mv_cat == ModelCat::NavMesh
+                let lod_ok = !hide_lods
+                    || mv_cat == ModelCat::NavMesh
                     || (!hay.contains("_slod")
                         && !hay.contains("_lod.")
                         && !hay.contains("_lod_")
@@ -2557,21 +2524,19 @@ impl Rpf9App {
                     && lod_ok
                     && inc.iter().all(|t| hay.contains(t))
                     && !exc.iter().any(|t| hay.contains(t))
-            })
-            .map(|(i, _)| i)
-            .collect();
+            });
         {
             let st = self.state.lock().unwrap();
             let size = |mi: usize| st.entries.get(self.mv_entries[mi].0).map_or(0, |e| e.raw_size);
             match self.sort_mode {
                 SortMode::Relevance => {
                     if let Some(first) = inc.first() {
-                        view.sort_by_key(|&i| (!self.mv_entries[i].2.starts_with(first), self.mv_entries[i].2.len()));
+                        view.sort_unstable_by_key(|&i| (!self.mv_entries[i].2.starts_with(first), self.mv_entries[i].2.len(), i));
                     }
                 }
-                SortMode::SizeDesc => view.sort_by_key(|&i| std::cmp::Reverse(size(i))),
-                SortMode::SizeAsc => view.sort_by_key(|&i| size(i)),
-                SortMode::Name => view.sort_by(|&a, &b| self.mv_entries[a].2.cmp(&self.mv_entries[b].2)),
+                SortMode::SizeDesc => view.sort_unstable_by_key(|&i| (std::cmp::Reverse(size(i)), i)),
+                SortMode::SizeAsc => view.sort_unstable_by_key(|&i| (size(i), i)),
+                SortMode::Name => view.sort_unstable_by(|&a, &b| self.mv_entries[a].2.cmp(&self.mv_entries[b].2).then(a.cmp(&b))),
             }
         }
         self.mv_view = view;
@@ -3629,8 +3594,25 @@ impl Rpf9App {
             let st = self.state.lock().unwrap();
             indices.iter().filter_map(|&i| st.entries.get(i).cloned()).collect()
         };
+        if self.export_busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.export_cancel.store(false, Ordering::SeqCst);
+        let (busy, cancel) = (Arc::clone(&self.export_busy), Arc::clone(&self.export_cancel));
+        let state = Arc::clone(&self.state);
+        let is_folder = self.is_folder;
+        std::thread::spawn(move || {
+        let total = entries.len();
         let mut ok = 0usize;
-        for e in entries {
+        let mut last_note = Instant::now();
+        for (n, e) in entries.into_iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            if last_note.elapsed() > Duration::from_millis(200) {
+                last_note = Instant::now();
+                state.lock().unwrap().status = format!("Exporting {}/{total}: {}", n + 1, e.name);
+            }
             if e.kind == "MODEL" || e.kind == "VEH" {
                 if let Ok(mesh) = decode_rage9_model_from_rpf(&e.source_rpf, e.offset, &e.name) {
                     let fname = format!("{}.obj", safe_file_name(&e.name.replace('#', "")));
@@ -3669,14 +3651,55 @@ impl Rpf9App {
                     }
                 }
             } else if let Ok(data) = read_entry_bytes(&e) {
-                let fname = if self.is_folder { format!("{}_{}", e.rpf_name.trim_end_matches(".rpf"), e.name) } else { e.name.clone() };
+                let fname = if is_folder { format!("{}_{}", e.rpf_name.trim_end_matches(".rpf"), e.name) } else { e.name.clone() };
                 if fs::write(out_dir.join(safe_file_name(&fname)), &data).is_ok() {
                     ok += 1;
                 }
             }
         }
-        self.state.lock().unwrap().status = format!("Exported {ok} file(s) to {}", out_dir.display());
+        let stopped = if cancel.load(Ordering::Relaxed) { " (cancelled)" } else { "" };
+        state.lock().unwrap().status = format!("Exported {ok} file(s) to {}{stopped}", out_dir.display());
+        busy.store(false, Ordering::SeqCst);
+        });
     }
+}
+
+// runs a selection decode off the ui thread
+// the result is dropped when a newer job started meanwhile and a panicking decoder still clears the spinner
+fn spawn_media_job<T: 'static>(
+    media: &Arc<Mutex<MediaState>>,
+    status: String,
+    fresh: bool,
+    work: impl FnOnce(&(dyn Fn(String) + Sync)) -> Result<T, String> + Send + 'static,
+    done: impl FnOnce(&mut MediaState, Result<T, String>) + Send + 'static,
+) {
+    let job = {
+        let mut m = media.lock().unwrap();
+        if fresh {
+            m.job += 1;
+        }
+        m.loading = true;
+        m.status = status;
+        m.job
+    };
+    let media = Arc::clone(media);
+    std::thread::spawn(move || {
+        let progress = |text: String| {
+            if let Ok(mut m) = media.try_lock() {
+                if m.job == job {
+                    m.status = text;
+                }
+            }
+        };
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&progress)))
+            .unwrap_or_else(|_| Err("decoder panicked".into()));
+        let mut m = media.lock().unwrap_or_else(|p| p.into_inner());
+        if m.job != job {
+            return;
+        }
+        m.loading = false;
+        done(&mut m, res);
+    });
 }
 
 fn app_data_dir() -> Option<PathBuf> {
@@ -3736,81 +3759,131 @@ fn load_ui_state(app: &mut Rpf9App) {
 }
 
 fn load_disk_cache() -> HashMap<String, Vec<RpfEntry>> {
+    cache_file_path().map(|p| load_disk_cache_from(&p)).unwrap_or_default()
+}
+
+fn load_disk_cache_from(p: &Path) -> HashMap<String, Vec<RpfEntry>> {
     let mut map: HashMap<String, Vec<RpfEntry>> = HashMap::new();
-    let Some(p) = cache_file_path() else { return map };
-    let Ok(f) = File::open(p) else { return map };
-    for line in BufReader::new(f).lines().map_while(Result::ok) {
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 9 { continue; }
-        let kind: &'static str = match cols[4] {
-            "VEH" => "VEH",
-            "MODEL" => "MODEL",
-            "TXD" => "TXD",
-            "TTPF" => "TTPF",
-            "RBF0" => "RBF0",
-            "GFX" => "GFX",
-            "GXT" => "GXT",
-            "NAVM" => "NAVM",
-            "BK2" => "BK2",
-            "AWC" => "AWC",
-            "XML" => "XML",
-            "DAT" => "DAT",
-            "HMAP" => "HMAP",
-            "PSIN" => "PSIN",
-            "ANIM" => "ANIM",
-            "RSC9" => "RSC9",
-            "META7A" => "META7A",
-            _ => "ZLIB",
-        };
-        // tolerate old 11 col cache rows and newer 10 col ones
-        let tracks_col = if cols.len() >= 11 { 9 } else { 8 };
-        let chunks_col = tracks_col + 1;
-        let chunks = if cols.len() > chunks_col && !cols[chunks_col].is_empty() {
-            cols[chunks_col].split(';').filter_map(|pair| {
-                let mut it = pair.split(',');
-                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
-            }).collect()
-        } else {
-            Vec::new()
-        };
-        map.entry(cols[0].to_string()).or_default().push(RpfEntry {
-            source_rpf: PathBuf::from(cols[1]),
-            rpf_name: cols[2].to_string(),
-            name: cols[3].to_string(),
-            kind,
-            offset: cols[5].parse().unwrap_or(0),
-            comp_size: cols[6].parse().unwrap_or(0),
-            raw_size: cols[7].parse().unwrap_or(0),
-            tracks: cols[tracks_col].parse().unwrap_or(0),
-            chunks,
-        });
+    let Ok(bytes) = fs::read(p) else { return map };
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    for row in par_map(&lines, |l| parse_cache_row(l)).into_iter().flatten() {
+        let (key, e) = row;
+        match map.get_mut(key) {
+            Some(v) => v.push(e),
+            None => {
+                map.insert(key.to_string(), vec![e]);
+            }
+        }
     }
     map
 }
 
+fn parse_cache_row(line: &str) -> Option<(&str, RpfEntry)> {
+    let mut cols = [""; 12];
+    let mut n = 0;
+    for c in line.split('\t') {
+        if n == cols.len() {
+            break;
+        }
+        cols[n] = c;
+        n += 1;
+    }
+    if n < 9 {
+        return None;
+    }
+    let kind: &'static str = match cols[4] {
+        "VEH" => "VEH",
+        "MODEL" => "MODEL",
+        "TXD" => "TXD",
+        "TTPF" => "TTPF",
+        "RBF0" => "RBF0",
+        "GFX" => "GFX",
+        "GXT" => "GXT",
+        "NAVM" => "NAVM",
+        "BK2" => "BK2",
+        "AWC" => "AWC",
+        "XML" => "XML",
+        "DAT" => "DAT",
+        "HMAP" => "HMAP",
+        "PSIN" => "PSIN",
+        "ANIM" => "ANIM",
+        "RSC9" => "RSC9",
+        "META7A" => "META7A",
+        _ => "ZLIB",
+    };
+    // tolerate old 11 col cache rows and newer 10 col ones
+    let tracks_col = if n >= 11 { 9 } else { 8 };
+    let chunks_col = tracks_col + 1;
+    let chunks = if n > chunks_col && !cols[chunks_col].is_empty() {
+        cols[chunks_col].split(';').filter_map(|pair| {
+            let mut it = pair.split(',');
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        }).collect()
+    } else {
+        Vec::new()
+    };
+    Some((cols[0], RpfEntry {
+        source_rpf: PathBuf::from(cols[1]),
+        rpf_name: cols[2].to_string(),
+        name: cols[3].to_string(),
+        kind,
+        offset: cols[5].parse().unwrap_or(0),
+        comp_size: cols[6].parse().unwrap_or(0),
+        raw_size: cols[7].parse().unwrap_or(0),
+        tracks: cols[tracks_col].parse().unwrap_or(0),
+        chunks,
+    }))
+}
+
 // atomic write via tmp file so ctrl c never corrupts the cahce
 fn save_disk_cache(map: &HashMap<String, Vec<RpfEntry>>) {
-    let Some(p) = cache_file_path() else { return };
+    if let Some(p) = cache_file_path() {
+        save_disk_cache_to(map, &p);
+    }
+}
+
+fn save_disk_cache_to(map: &HashMap<String, Vec<RpfEntry>>, p: &Path) {
     if let Some(parent) = p.parent() {
         let _ = fs::create_dir_all(parent);
     }
     let tmp = p.with_extension("tmp");
     let Ok(f) = File::create(&tmp) else { return };
     let mut w = BufWriter::new(f);
-    for (key, entries) in map {
-        for e in entries {
-            let chunks_s: String = e.chunks.iter().map(|(a, b)| format!("{a},{b}")).collect::<Vec<_>>().join(";");
-            let _ = writeln!(
-                w,
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                key, e.source_rpf.display(), e.rpf_name, e.name, e.kind,
-                e.offset, e.comp_size, e.raw_size, e.tracks, chunks_s
-            );
-        }
-    }
-    if w.flush().is_ok() {
+    // rows are formatted on all cores in blocks then written in order
+    let rows: Vec<(&str, &RpfEntry)> = map.iter().flat_map(|(k, v)| v.iter().map(move |e| (k.as_str(), e))).collect();
+    let per = rows.len().div_ceil(std::thread::available_parallelism().map_or(1, |n| n.get())).max(8192);
+    let blocks: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let parts: Vec<_> = rows
+            .chunks(per)
+            .map(|c| {
+                s.spawn(move || {
+                    let mut b = Vec::with_capacity(c.len() * 200);
+                    for (key, e) in c {
+                        let _ = write!(
+                            b,
+                            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t",
+                            key, e.source_rpf.display(), e.rpf_name, e.name, e.kind,
+                            e.offset, e.comp_size, e.raw_size, e.tracks
+                        );
+                        for (j, (a, z)) in e.chunks.iter().enumerate() {
+                            let _ = write!(b, "{}{a},{z}", if j > 0 { ";" } else { "" });
+                        }
+                        b.push(b'\n');
+                    }
+                    b
+                })
+            })
+            .collect();
+        parts.into_iter().map(|p| p.join().unwrap_or_default()).collect()
+    });
+    // a failed write must never replace the good cache with a cut one
+    if blocks.iter().all(|b| w.write_all(b).is_ok()) && w.flush().is_ok() {
         drop(w);
-        let _ = fs::rename(&tmp, &p);
+        let _ = fs::rename(&tmp, p);
+    } else {
+        drop(w);
+        let _ = fs::remove_file(&tmp);
     }
 }
 
@@ -3831,16 +3904,15 @@ fn collect_rpfs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
+type AwcPlayerTracks = Option<(Vec<audio_player::LoadedWavTrack>, Arc<Vec<u8>>)>;
+
+// status line and decoded tracks of one awc entry for the audio player
+fn decode_awc_for_player(e: &RpfEntry, progress: &(dyn Fn(String) + Sync)) -> (String, AwcPlayerTracks) {
     match read_entry_bytes(e) {
         Ok(bytes) => {
             let res = awc::decode_awc_bytes_in_memory(&bytes, "stream", |done, total| {
-                if let Ok(mut m) = media.try_lock() {
-                    m.status = format!("Scanning AWC waveforms ({done}/{total})...");
-                }
+                progress(format!("Scanning AWC waveforms ({done}/{total})..."));
             });
-            let mut m = media.lock().unwrap();
-            m.loading = false;
             if res.tracks.is_empty() {
                 let mut lines = vec![
                     format!("Decoded 0 playable .wav stream(s) natively — {}", res.summary),
@@ -3850,22 +3922,18 @@ fn decode_awc_for_player(e: &RpfEntry, media: &Arc<Mutex<MediaState>>) {
                     ),
                 ];
                 lines.extend(res.details);
-                m.status = lines.join("\n");
-                m.loaded_tracks = None;
+                (lines.join("\n"), None)
             } else {
-                m.status = format!("Decoded {} playable .wav stream(s) natively", res.tracks.len());
-                m.loaded_tracks = Some((res.tracks, Arc::new(bytes)));
+                (format!("Decoded {} playable .wav stream(s) natively", res.tracks.len()), Some((res.tracks, Arc::new(bytes))))
             }
         }
-        Err(err) => {
-            let mut m = media.lock().unwrap();
-            m.loading = false;
-            m.status = format!(
+        Err(err) => (
+            format!(
                 "Decoded 0 playable .wav stream(s) natively — Read error: {err}\nEntry: {} (comp={}, raw={}, offset=0x{:X}, RPF: {})",
                 e.name, e.comp_size, e.raw_size, e.offset, e.rpf_name
-            );
-            m.loaded_tracks = None;
-        }
+            ),
+            None,
+        ),
     }
 }
 
@@ -4370,6 +4438,67 @@ fn probe_rage9_page(
     })
 }
 
+// runs probe_rage9_page on every 4kb page of buf on all cores, slot i holds the page at i * 0x1000
+fn probe_pages(buf: &[u8], read_n: usize, off: u64, path: &Path, rname: &str) -> Vec<Option<RpfEntry>> {
+    use std::sync::atomic::AtomicUsize;
+    const PAGES_PER_JOB: usize = 64;
+    let pages = if read_n >= 44 { (read_n - 44) / 0x1000 + 1 } else { 0 };
+    let mut out: Vec<Option<RpfEntry>> = (0..pages).map(|_| None).collect();
+    let next = AtomicUsize::new(0);
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get()).min(pages.div_ceil(PAGES_PER_JOB)).max(1);
+    let found: Vec<Vec<(usize, RpfEntry)>> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..cores)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut dec = Decompress::new(true);
+                    let mut scratch = vec![0u8; 32768];
+                    let mut hits = Vec::new();
+                    loop {
+                        let job = next.fetch_add(1, Ordering::Relaxed) * PAGES_PER_JOB;
+                        if job >= pages {
+                            return hits;
+                        }
+                        for i in job..(job + PAGES_PER_JOB).min(pages) {
+                            if let Some(e) = probe_rage9_page(buf, i * 0x1000, read_n, off, path, rname, &mut dec, &mut scratch) {
+                                hits.push((i, e));
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap_or_default()).collect()
+    });
+    for (i, e) in found.into_iter().flatten() {
+        out[i] = Some(e);
+    }
+    out
+}
+
+type ChunkReader = (std::sync::mpsc::Sender<u64>, std::sync::mpsc::Receiver<(u64, std::io::Result<Vec<u8>>)>);
+
+// reads 16mb chunks on its own thread one request ahead so the disk never waits for the probes
+// send an offset, receive (offset, bytes); an empty chunk means end of file
+fn spawn_chunk_reader(path: &Path) -> std::io::Result<ChunkReader> {
+    let mut f = File::open(path)?;
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<u64>();
+    let (res_tx, res_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for at in req_rx {
+            let res = f.seek(SeekFrom::Start(at)).and_then(|_| {
+                let mut b = vec![0u8; 16 * 1024 * 1024];
+                let n = f.read(&mut b)?;
+                b.truncate(n);
+                Ok(b)
+            });
+            if res_tx.send((at, res)).is_err() {
+                return;
+            }
+        }
+    });
+    Ok((req_tx, res_rx))
+}
+
 // single 16mb sequntial stream avoids hdd seek thrash while indexing vehicles
 fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<ScanState>>>) -> Vec<RpfEntry> {
     let sz = fs::metadata(levels_rpf).map(|m| m.len()).unwrap_or(0);
@@ -4377,23 +4506,21 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
     let total_len = sz.saturating_sub(start_off);
     if total_len == 0 { return Vec::new(); }
     let rname = levels_rpf.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let Ok(mut f) = File::open(levels_rpf) else { return Vec::new() };
-    if f.seek(SeekFrom::Start(start_off)).is_err() { return Vec::new(); }
+    let Ok((req, chunks)) = spawn_chunk_reader(levels_rpf) else { return Vec::new() };
 
     let mut all_entries: Vec<RpfEntry> = Vec::new();
     let mut local_batch: Vec<RpfEntry> = Vec::with_capacity(32);
-    let mut buf = vec![0u8; 16 * 1024 * 1024];
-    let mut probe_dec = Decompress::new(true);
-    let mut probe_out = vec![0u8; 32768];
     let mut off = start_off;
     let mut last_pct = 999u64;
+    let _ = req.send(off);
 
     while off < sz {
-        let Ok(n) = f.read(&mut buf) else { break };
+        let Ok((_, Ok(buf))) = chunks.recv() else { break };
+        let n = buf.len();
         if n == 0 { break; }
-        let mut pos = 0usize;
-        while pos + 44 <= n {
-            if let Some(entry) = probe_rage9_page(&buf, pos, n, off, levels_rpf, &rname, &mut probe_dec, &mut probe_out) {
+        let _ = req.send(off + n as u64);
+        for entry in probe_pages(&buf, n, off, levels_rpf, &rname).into_iter().flatten() {
+            {
                 local_batch.push(entry);
                 if local_batch.len() >= 15 {
                     if let Some(st) = live_state {
@@ -4404,7 +4531,6 @@ fn scan_levels_vehicle_zone(levels_rpf: &PathBuf, live_state: Option<&Arc<Mutex<
                     all_entries.append(&mut local_batch);
                 }
             }
-            pos += 0x1000;
         }
         off += n as u64;
         if let Some(st) = live_state {
@@ -4485,14 +4611,19 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     };
     let mut found = Vec::new();
     let mut off = 0u64;
-    let mut buf = if whole.is_some() { Vec::new() } else { vec![0u8; 16 * 1024 * 1024] };
     let mut probe_dec = Decompress::new(true);
     let mut probe_out = vec![0u8; 32768];
     let mut bk2_idx = 0usize;
     let mut awc_idx = 0usize;
     let mut last_ui_mb = 0u64;
-    let mut need_seek = true;
     let scan_limit = if rname.eq_ignore_ascii_case("levels.rpf") && sz > VEH_ZONE_OFF { VEH_ZONE_OFF } else { sz };
+    // a page probe reads the same bytes whatever offset the whole-file slice starts at, so one pass covers every page
+    let mut whole_pages = whole.as_ref().map(|w| probe_pages(w, w.len(), 0, path, &rname)).unwrap_or_default();
+    let reader = if whole.is_none() { Some(spawn_chunk_reader(path)?) } else { None };
+    let mut chunk: Vec<u8>;
+    if let Some((req, _)) = &reader {
+        let _ = req.send(0);
+    }
 
     while off < scan_limit {
         if let Some(st) = progress_state {
@@ -4503,23 +4634,45 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
             }
         }
         let read_n;
+        let mut chunk_pages = Vec::new();
         let buf: &[u8] = if let Some(w) = &whole {
             let s = &w[(off as usize).min(w.len())..];
             read_n = s.len();
             s
         } else {
-            if need_seek {
-                f.seek(SeekFrom::Start(off))?;
-                need_seek = false;
+            let (req, chunks) = reader.as_ref().expect("reader exists without whole");
+            loop {
+                let (at, res) = chunks.recv().map_err(|_| std::io::Error::other("reader thread stopped"))?;
+                // a read queued before a jump is stale, the jump target was requested right after it
+                if at == off {
+                    chunk = res?;
+                    break;
+                }
             }
-            read_n = f.read(&mut buf)?;
-            &buf[..read_n]
+            read_n = chunk.len();
+            if read_n > 0 {
+                let _ = req.send(off + read_n as u64);
+                chunk_pages = probe_pages(&chunk, read_n, off, path, &rname);
+            }
+            &chunk
         };
         if read_n == 0 { break; }
         let mut pos = 0usize;
         let mut jumped = false;
         while pos + 44 <= read_n {
-            if let Some(entry) = probe_rage9_page(buf, pos, read_n, off, path, &rname, &mut probe_dec, &mut probe_out) {
+            let abs = off as usize + pos;
+            let pre = if whole.is_some() && abs.is_multiple_of(0x1000) {
+                whole_pages.get_mut(abs / 0x1000).map(Option::take)
+            } else if whole.is_none() && pos.is_multiple_of(0x1000) {
+                chunk_pages.get_mut(pos / 0x1000).map(Option::take)
+            } else {
+                None
+            };
+            let probed = match pre {
+                Some(p) => p,
+                None => probe_rage9_page(buf, pos, read_n, off, path, &rname, &mut probe_dec, &mut probe_out),
+            };
+            if let Some(entry) = probed {
                 found.push(entry);
                 pos += 0x1000;
                 continue;
@@ -4567,7 +4720,9 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
                     if next_page > off + read_n as u64 {
                         off = next_page;
                         jumped = true;
-                        need_seek = true;
+                        if let Some((req, _)) = &reader {
+                            let _ = req.send(off);
+                        }
                         break;
                     } else {
                         pos = (next_page - off) as usize;
@@ -4678,6 +4833,61 @@ fn scan_single_rpf(path: &PathBuf, progress_state: Option<&Arc<Mutex<ScanState>>
     }
 
     Ok((hdr_info, found))
+}
+
+// lowercase search text per entry, index matches entries
+fn build_hay(entries: &[RpfEntry]) -> Vec<String> {
+    par_map(entries, |e| {
+        let shown = display_entry_name(e, false);
+        let mut h = String::with_capacity(e.name.len() + shown.len() + e.rpf_name.len() + e.kind.len() + 3);
+        for (i, part) in [e.name.as_str(), &shown, &e.rpf_name, e.kind].into_iter().enumerate() {
+            if i > 0 {
+                h.push('|');
+            }
+            h.push_str(part);
+        }
+        if h.is_ascii() {
+            h.make_ascii_lowercase();
+            h
+        } else {
+            h.to_lowercase()
+        }
+    })
+}
+
+// indices in 0..n that pass keep, in order, checked on all cores
+fn par_filter(n: usize, keep: impl Fn(usize) -> bool + Sync) -> Vec<usize> {
+    let cores = std::thread::available_parallelism().map_or(1, |c| c.get());
+    let per = n.div_ceil(cores).max(16384);
+    if per >= n {
+        return (0..n).filter(|&i| keep(i)).collect();
+    }
+    let keep = &keep;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = (0..n)
+            .step_by(per)
+            .map(|a| s.spawn(move || (a..(a + per).min(n)).filter(|&i| keep(i)).collect::<Vec<_>>()))
+            .collect();
+        parts.into_iter().flat_map(|p| p.join().expect("par_filter worker panicked")).collect()
+    })
+}
+
+// order keeping map over all cores for the big per entry passes
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = items.len().div_ceil(cores).max(4096);
+    if per >= items.len() {
+        return items.iter().map(f).collect();
+    }
+    let f = &f;
+    std::thread::scope(|s| {
+        let parts: Vec<_> = items.chunks(per).map(|c| s.spawn(move || c.iter().map(f).collect::<Vec<R>>())).collect();
+        let mut out = Vec::with_capacity(items.len());
+        for p in parts {
+            out.extend(p.join().expect("par_map worker panicked"));
+        }
+        out
+    })
 }
 
 fn display_entry_name(e: &RpfEntry, audio_named: bool) -> std::borrow::Cow<'_, str> {
@@ -4847,6 +5057,14 @@ impl eframe::App for Rpf9App {
                 ui.label(RichText::new("PERCYSTAR").size(17.0).strong().color(Color32::from_rgb(255, 168, 28)));
                 ui.label(RichText::new("RPF9").size(13.0).strong().color(Color32::from_rgb(255, 72, 165)));
                 ui.label(RichText::new(format!("v{APP_VERSION}")).size(11.5).color(Color32::from_rgb(165, 145, 195)));
+                if ui
+                    .add(egui::Button::new(RichText::new("♥ Sponsor").size(11.0).color(Color32::from_rgb(155, 135, 185))).frame(false))
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text("Optional: support ongoing R&D on GitHub Sponsors")
+                    .clicked()
+                {
+                    ctx.open_url(egui::OpenUrl::new_tab("https://github.com/sponsors/rpatty-dev"));
+                }
                 ui.add_space(10.0);
                 // Top-level mode tabs: Explorer | Model Viewer | World Map | Shaders (RDNA2)
                 for (tab_id, label) in [
@@ -4939,12 +5157,18 @@ impl eframe::App for Rpf9App {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Export All").clicked() {
+                    let exporting = self.export_busy.load(Ordering::Relaxed);
+                    if exporting {
+                        if ui.button("Cancel Export").clicked() {
+                            self.export_cancel.store(true, Ordering::SeqCst);
+                        }
+                        ctx.request_repaint_after(Duration::from_millis(200));
+                    } else if ui.button("Export All").clicked() {
                         let n = self.state.lock().unwrap().entries.len();
                         let all: Vec<usize> = (0..n).collect();
                         self.export_entries(&all);
                     }
-                    if ui.button("Export Selected").clicked() {
+                    if !exporting && ui.button("Export Selected").clicked() {
                         let targets = self.ordered_selected_indices();
                         if !targets.is_empty() {
                             self.export_entries(&targets);
@@ -5693,6 +5917,85 @@ fn extract_sgd5_cli(src: &Path, out_dir: &Path, limit: usize) {
     }
 }
 
+fn decode_audio_cli(rpf_path: &Path, out_dir: &Path, limit: usize) {
+    let _ = fs::create_dir_all(out_dir);
+    let Ok(mut f) = File::open(rpf_path) else {
+        eprintln!("Failed to open {}", rpf_path.display());
+        return;
+    };
+    let sz = f.metadata().map(|m| m.len()).unwrap_or(0).min(2 * 1024 * 1024 * 1024);
+    let mut off = 0u64;
+    let mut buf = vec![0u8; 16 * 1024 * 1024];
+    let mut banks = Vec::new();
+    while off < sz {
+        let Ok(n) = f.read(&mut buf) else { break };
+        if n == 0 { break; }
+        let mut pos = 0usize;
+        while pos + 16 <= n {
+            if &buf[pos..pos + 4] == b"ADAT" {
+                let sc = u32::from_le_bytes([buf[pos + 8], buf[pos + 9], buf[pos + 10], buf[pos + 11]]);
+                let hdr_sz = u32::from_le_bytes([buf[pos + 12], buf[pos + 13], buf[pos + 14], buf[pos + 15]]);
+                if (1..=256).contains(&sc) && (16..=65536).contains(&hdr_sz) {
+                    banks.push((off + pos as u64, sc));
+                    if limit > 0 && banks.len() >= limit { break; }
+                }
+            }
+            pos += 16;
+        }
+        if limit > 0 && banks.len() >= limit { break; }
+        off += n.saturating_sub(64) as u64;
+        let _ = f.seek(SeekFrom::Start(off));
+    }
+    let mut total_wavs = 0usize;
+    let mut bank_data = vec![0u8; 256 * 1024];
+    for (i, &(bank_off, sc)) in banks.iter().enumerate() {
+        let _ = f.seek(SeekFrom::Start(bank_off));
+        let n = f.read(&mut bank_data).unwrap_or(0);
+        let stem = format!("bank_{i:03}_off_{bank_off:08x}_{sc}st");
+        let res = awc::decode_awc_bytes_to_wavs_detailed(&bank_data[..n], out_dir, &stem);
+        total_wavs += res.wavs.len();
+    }
+    println!("Exported {total_wavs} WAV tracks from {} banks -> {}", banks.len(), out_dir.display());
+}
+
+fn decode_navmesh_cli(rpf_path: &Path, out_dir: &Path, limit: usize) {
+    let _ = fs::create_dir_all(out_dir);
+    let Ok(mut f) = File::open(rpf_path) else {
+        eprintln!("Failed to open {}", rpf_path.display());
+        return;
+    };
+    let base_off = 786_010_112u64;
+    let _ = f.seek(SeekFrom::Start(base_off));
+    let mut buf = vec![0u8; 32 * 1024 * 1024];
+    let n = f.read(&mut buf).unwrap_or(0);
+    let mut dec = Decompress::new(true);
+    let mut out = vec![0u8; 32768];
+    let mut ok = 0usize;
+    let mut pos = 0usize;
+    while pos + 32 <= n {
+        if buf[pos] == 0x78 && matches!(buf[pos + 1], 0x01 | 0x5e | 0x9c | 0xda) {
+            dec.reset(true);
+            let _ = dec.decompress(&buf[pos..(pos + 32768).min(n)], &mut out, FlushDecompress::None);
+            if dec.total_out() >= 0xD0 && u32::from_le_bytes([out[0x14], out[0x15], out[0x16], out[0x17]]) == 0x0001_0015 {
+                let midx = u32::from_le_bytes([out[0xC8], out[0xC9], out[0xCA], out[0xCB]]);
+                let nm = if midx < 512 * 512 {
+                    format!("nav_{:03}_{:03}", midx % 512, midx / 512)
+                } else {
+                    format!("nav_dyn_{midx:06x}")
+                };
+                if let Ok(mesh) = tex::decode_navmesh_from_rpf(rpf_path, base_off + pos as u64, &nm) {
+                    if mesh.export_obj(&out_dir.join(format!("{nm}.obj"))).is_ok() {
+                        ok += 1;
+                        if limit > 0 && ok >= limit { break; }
+                    }
+                }
+            }
+        }
+        pos += 16;
+    }
+    println!("Exported {ok} CNavMesh .obj tiles -> {}", out_dir.display());
+}
+
 fn disassemble_dxbc_cli(src: &Path, output: Option<&PathBuf>) {
     match fs::read(src) {
         Ok(data) => {
@@ -5742,6 +6045,10 @@ fn main() -> eframe::Result<()> {
             eprintln!("{error}");
             std::process::exit(1);
         }
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--bench" {
+        bench::run(Path::new(&args[2]), args.get(3).and_then(|s| s.parse().ok()).unwrap_or(3), args.get(4).map_or("", String::as_str));
         return Ok(());
     }
     if args.len() >= 3 && args[1] == "--probe-maps" {
@@ -5837,6 +6144,16 @@ fn main() -> eframe::Result<()> {
         export_models_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), filt, false);
         return Ok(());
     }
+    if args.len() >= 4 && args[1] == "--decode-audio" {
+        let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        decode_audio_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
+        return Ok(());
+    }
+    if args.len() >= 4 && args[1] == "--decode-navmesh" {
+        let lim = args.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+        decode_navmesh_cli(&PathBuf::from(&args[2]), &PathBuf::from(&args[3]), lim);
+        return Ok(());
+    }
 
     // decod embedded logo once and share bytes across window icon and topbar
     let logo_rgba = image::load_from_memory(include_bytes!("../assets/logo.png"))
@@ -5859,6 +6176,32 @@ fn main() -> eframe::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_idle(media: &Arc<Mutex<MediaState>>) {
+        for _ in 0..400 {
+            if !media.lock().unwrap_or_else(|p| p.into_inner()).loading {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("media job never finished");
+    }
+
+    #[test]
+    fn media_jobs_drop_stale_results_and_survive_panics() {
+        let media = Arc::new(Mutex::new(MediaState::default()));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        spawn_media_job(&media, "slow".into(), true, move |_| { let _ = held.recv(); Ok(1u32) }, |m, _| m.status = "old".into());
+        spawn_media_job(&media, "fast".into(), true, |_| Ok(2u32), |m, _| m.status = "new".into());
+        wait_idle(&media);
+        release.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(media.lock().unwrap().status, "new");
+
+        spawn_media_job(&media, "boom".into(), true, |_| -> Result<u32, String> { panic!("decoder bug") }, |m, res| m.status = res.unwrap_err());
+        wait_idle(&media);
+        assert_eq!(media.lock().unwrap().status, "decoder panicked");
+    }
 
     #[test]
     fn model_sidebar_width_stays_stable_across_frames() {

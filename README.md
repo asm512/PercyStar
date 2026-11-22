@@ -9,7 +9,8 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-v1.4.7-FFA81C?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/Version-v1.5.1-FFA81C?style=flat-square" alt="Version" />
+  <a href="https://github.com/sponsors/rpatty-dev"><img src="https://img.shields.io/badge/Sponsor-%E2%99%A5%20Support%20Development-ea4aaa?style=flat-square&logo=githubsponsors" alt="Sponsor" /></a>
   <img src="https://img.shields.io/badge/Rust-1.89%2B-orange?style=flat-square&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Shaders-RDNA2%20GFX10.3%20%E2%86%92%20HLSL%20%2F%20SPIR--V-FF4FA3?style=flat-square" alt="Shaders" />
   <img src="https://img.shields.io/badge/Textures-100%25%20DXGI%20%2B%20RDNA2%204KB%2F64KB-48D2FF?style=flat-square" alt="Textures" />
@@ -61,6 +62,50 @@
 </details>
 
 ---
+
+## What's New (v1.5.0) — Speed Release
+
+Every hot path was timed on a real GTA VI build (Ryzen 5 3600XT, 16 GB RAM, game on a 7200 rpm HDD), then made faster without changing a single result. Best of 3 runs, warm files, same machine, back to back:
+
+| Task | v1.4.8 | v1.5.0 | Faster |
+|---|---:|---:|---:|
+| Load scan index at startup (1.32M entries) | 1671 ms | 640 ms | **2.6x** |
+| Build search index | 687 ms | 62 ms | **11x** |
+| Search query (`adder`) | 54.5 ms | 12.4 ms | **4.4x** |
+| Search query (`tex_ bc7 -mip`) | 61.4 ms | 11.9 ms | **5.2x** |
+| Save scan index | 4227 ms | 509 ms | **8.3x** |
+| Open 40 texture dictionaries (textures.rpf) | 15428 ms | 5980 ms | **2.6x** |
+| Decode 60 TTPF textures | 9.8 ms | 5.1 ms | **1.9x** |
+| Scan data.rpf (459 MB) | 4517 ms | 1887 ms | **2.4x** |
+| Scan shaders.rpf (393 MB) | 1347 ms | 945 ms | **1.4x** |
+| Scan script.rpf | 34.5 ms | 19.8 ms | **1.7x** |
+| Scan common.rpf | 82.2 ms | 49.6 ms | **1.7x** |
+| Scan packs.rpf (4.5 GB, disk bound) | 40.4 s | 33.3 s | **1.2x** |
+
+**Proof the output is identical:** the benchmark prints a checksum of every scan result, every decoded pixel and the whole search index. All of them match between v1.4.8 and v1.5.0, and a save then reload of the scan index gives back the same data. Full raw output: [`docs/bench/v1.4.8_vs_v1.5.0.txt`](docs/bench/v1.4.8_vs_v1.5.0.txt).
+
+**Run it yourself:** `PercyStar.exe --bench "<game folder>" [runs] [filter]` (filter is a comma list such as `cache,txd,data.rpf`).
+
+What changed:
+- **BC1 / BC2 / BC3 / BC4 / BC5 / BC6H / BC7 decoding uses every CPU core** (image split into bands of block rows). BC7 was 80% of texture dictionary load time.
+- **zlib now uses the `zlib-rs` backend** (pure Rust, faster inflate) for all archive reads.
+- **Archive scanning probes every 4 KB page on all cores** and reads the next 16 MB chunk on its own thread while the current one is probed, so the disk never waits. Same for the levels.rpf vehicle index.
+- **Scan index (`scan_cache_v9.tsv`) loads and saves on all cores**; a failed save no longer replaces a good cache with a cut one.
+- **Search index, filtering and the Model Viewer list are built on all cores**; sorting skips the merge buffer while keeping the exact same order.
+- **Verified Test Suite**: `98 passed; 0 failed` (`cargo test --release`).
+
+## What's New (v1.4.8)
+
+- **Stale Decode & World Streamer Reliability (PR #43, `@asm512`)**:
+  - Dropped superseded out-of-order selection decodes (model, navmesh, TXD/TTPF, AWC) and ensured decoder panics clear the spinner.
+  - Re-queued skipped world streamer models when the camera moves mid-batch, eliminating permanent map holes.
+- **World Textures, Cell Batching & Background Export (PR #43 + PercyStar Optimizations)**:
+  - World streamer reads capped 128px mips directly (`decode_ttpf_texture_capped`) with shared texture uploads, 1 GiB byte-bounded TTPF cache, thread-local `File` handle reuse (`LAST_TTPF_FILE`), and `Rc<PathBuf>` chunk cache keys.
+  - 1024 m cell batching for per-cell culling (draw cap `6000`), lock-free per-worker streaming completion (`(cores / 2).clamp(3, 6)` threads, zero per-archetype mutex/sleep), background Export All/Selected with Cancel, and 45s scan-cache autosave.
+- **RF World View (`src/worldmap.rs`, `src/world_gpu.rs`)**:
+  - Added **RF World View** button alongside `Launch 3D GPU World (wgpu)` with Time-of-Day presets (`Dawn`, `Noon`, `Golden`, `Night`), `Water (V)` toggle, `700m`–`16km` draw radius presets, and `C`-down flight controls powered by `PercyStar`'s PBR/sky/water/RT shaders.
+  - Fixed `CEntityDef` world entity orientation (conjugated + finite-guarded quaternions) and replaced linear archetype distance scans with a `200m` spatial grid streaming nearest-cell-first up to `6 km`.
+- **Verified Test Suite**: `98 passed; 0 failed` (`cargo test --release`).
 
 ## What's New (v1.4.7)
 
@@ -219,6 +264,13 @@ cargo build --release
 
 Compiled standalone binary: `target/release/PercyStar.exe`. `scripts/build_linux.sh` and `scripts/build_macos.sh` package the other platforms. Every push and pull request is built and tested by [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
+---
+
+## Support & Donations
+
+PercyStar is completely free and open-source. If it's helped your research or saved you time and you'd ever like to kindly support ongoing R&D, server/hardware costs, and late-night builds, **[sponsoring via GitHub Sponsors](https://github.com/sponsors/rpatty-dev)** is always deeply appreciated — no pressure at all, starring the repo or sharing test reports helps just as much!
+
+
 Optional external tools are only loaded from trusted locations: `binkplay.exe` next to `PercyStar.exe`, on `PATH`, in the RAD install folders or from `BINKPLAY_PATH`; `dxcompiler.dll` next to `PercyStar.exe`, in `System32` or from `DXCOMPILER_DLL`; `bink2w64.dll` next to `PercyStar.exe` or from `BINK2_DLL`. They are never picked up from the working directory or from the folder of an opened file.
 
 ---
@@ -232,7 +284,9 @@ Optional external tools are only loaded from trusted locations: `binkplay.exe` n
   - [@worstgirlinamerica](https://github.com/worstgirlinamerica) (PRs #30, #31, #32, #33) — `scripts/build_linux.sh`, AWC superblock directory & stereo channel fix in `awc_extract.py`, `cfg(windows)` gating, and explicit `f32` literal fix.
   - [@Xyzstk](https://github.com/Xyzstk) (PRs #8, #29) — `SGD5` shader-group parser, `DXBC`/`FSSM` extraction, and reflection resource naming.
   - [@techfoundrynz](https://github.com/techfoundrynz) (PRs #12, #13, #21–#28) — `>4 GiB` TTPF addressing, format 99 `float3` meshlets, world-scale MHIU terrain in GPU World, north-up 2D map & heightmap alignment, Model Viewer sidebar stability, window/taskbar icons, startup feedback, and `Cargo.lock` sync.
-  - [@asm512](https://github.com/asm512) (PR #19) — In-file & sibling vehicle LOD switching (`Hi`/`Mid`/`Low`, `LOD0`–`LOD3`) and per-texture material layers + Texture Browser.
+  - [@asm512](https://github.com/asm512) (PRs #19, #43) — In-file & sibling vehicle LOD switching (`Hi`/`Mid`/`Low`, `LOD0`–`LOD3`), per-texture material layers + Texture Browser, stale-decode & streamer-hole fixes, 1024m cell batching, mip-capped TTPF reads, and background export with cancel.
+  - `@igvcc` (Discord) — `Bink2` container parser (`bink2_container.rs`), `BCPack` Row-3 base-seed fallback (`tex.rs`, optimized to 16×16 swatch), and `--decode-audio` / `--decode-navmesh` batch CLI extractors.
+  - [@nullbrik](https://github.com/nullbrik) ([RageForge](https://github.com/nullbrik/RageForge)) — Clean-room UX inspiration for `RF World View` (Time-of-Day presets, Water toggle, 700m–16km draw radius presets, and `C`-down flight controls).
   - [@GamingChelsea](https://github.com/GamingChelsea) (PRs #10, #18) — `audio.rpf` DAT metadata catalog & AWC auto-naming, AWC decode diagnostics, superblock stream splitting, and waveform audio player foundation.
   - [@Ahmet-Dedeler](https://github.com/Ahmet-Dedeler) ([Percy6Stars](https://github.com/Ahmet-Dedeler/Percy6Stars), PRs #6, #7, Issue #9) — macOS build & 3D viewer decoding, sorting, `RADTools.exe` fix, cutout/glass/decal blending, and licensing feedback.
   - [@paryzius](https://github.com/paryzius) ([ttpf-viewer](https://github.com/paryzius/ttpf-viewer)) — `.ttpf` reduced-mip fallback for unreadable mip 0 chunks.

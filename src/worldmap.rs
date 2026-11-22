@@ -416,6 +416,16 @@ pub fn render_world_map_ui(
                 Err(e) => wm.status = e,
             }
         }
+        if ui.add_enabled(!wm.gpu_starting, egui::Button::new(egui::RichText::new("RF World View").strong())).on_hover_text("RageForge-inspired 3D World View with Time-of-Day presets, Water toggle (V), 700m–16km draw radius & PercyStar PBR/RT shaders").clicked() {
+            match crate::world_gpu::launch_world_gpu_process(common_rpf, levels_rpf, ctx.clone()) {
+                Ok(rx) => {
+                    wm.gpu_launch = Some(rx);
+                    wm.gpu_starting = true;
+                    wm.status = "Starting RF World View...".into();
+                }
+                Err(e) => wm.status = e,
+            }
+        }
         ui.label(egui::RichText::new(&wm.status).size(11.5).color(Color32::from_rgb(175, 195, 220)));
     });
     ui.separator();

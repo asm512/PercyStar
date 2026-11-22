@@ -1,11 +1,12 @@
 {
   "title": "RAGE 9 Research & PercyStar Breakthroughs",
   "author": "@rpatty",
-  "lastUpdated": "2026-11-21 11:58 UTC",
-  "percystarVersion": "v1.3.6",
+  "lastUpdated": "2026-11-22 18:10 UTC",
+  "percystarVersion": "v1.4.8",
   "links": {
     "github": "https://github.com/rpatty-dev/PercyStar",
-    "latestRelease": "https://github.com/rpatty-dev/PercyStar/releases/tag/v1.3.3",
+    "latestRelease": "https://github.com/rpatty-dev/PercyStar/releases/tag/v1.4.8",
+    "percyscarlett": "https://github.com/rpatty-dev/PercyScarlett",
     "navmeshMap": "https://mapnavmeshsite.vercel.app",
     "heightmap": "https://mapnavmeshsite.vercel.app/HEIGHT.png"
   },
@@ -61,11 +62,38 @@
   ],
   "breakthroughs": [
     {
+      "id": "percyscarlett-v032-scarlett-bringup",
+      "timestamp": "2026-11-22 18:10 UTC",
+      "category": "Runtime / Scarlett Bring-Up",
+      "badge": "LIVE DX12 \u00b7 21,522/21,522 DXIL",
+      "latest": true,
+      "title": "PercyScarlett v0.3.2 \u2014 Native Win11 Xbox Series X|S Layer, 21,522/21,522 SM 6.6 DXIL & 6/6 Sidecars",
+      "summary": "Built a clean-room pure-Rust Xbox Series X|S translation layer (9 cdylib shims, 24/24 tests, 0 warnings) with 0 GB NTFS overlay: live-loads 6/6 shipped Xbox sidecar DLLs on Windows 11, lifts and compiles 21,522/21,522 (100.0%, fail=0) GTA VI RDNA2 shaders to SM 6.6 DXIL, and runs hardware ID3D12Device + CommandQueueX + PresentX + XAudio2Create.",
+      "details": [
+        "RDNA2 -> HLSL -> SM 6.6 DXIL (dxcompiler.dll): 21,522/21,522 compiled (VS/PS/CS/13,588 Mesh/64 RT), with SOPP control-flow CFG, MUBUF/MTBUF loads, Wave64 intrinsics, compressed EXP, and FSSM scanning.",
+        "PE32+ In-Process Loader: maps .reloc, sanitizes .pdata + RtlAddFunctionTable, redirects RtlPcToFileHeader for C++ exceptions, initializes static .tls (gs:[0x58]), and audits missing imports (--dry-run).",
+        "6/6 Sidecar DLLs live-loaded on Win11: amd_fidelityfx_loader_xbox.dll, amd_fidelityfx_upscaler_xbox.dll, Bink2Scarlett.dll, libHttpClient.GDK.dll, XboxBvhBuilder.dll, XCurl.dll."
+      ]
+    },
+    {
+      "id": "percystar-v148-world-model-formats",
+      "timestamp": "2026-11-22 17:38 UTC",
+      "category": "World / 3D Pipeline",
+      "badge": "CRACKED \u00b7 0DRPz + 0xB8 ARCH",
+      "latest": false,
+      "title": "PercyStar v1.4.8 \u2014 Exact 0DRPz Archetype Stride (0xB8), World Quaternions & 6 km Streaming",
+      "summary": "Solved exact RAGE 9 ArchetypeDefs record stride (0xB8) and conjugated CEntityDef world-space quaternions in levels.rpf, paired with a 200m spatial grid streaming up to 6 km, 128px mip-capped TTPF reads, and GFX10.3 2D_THIN Morton texture swizzle.",
+      "details": [
+        "World Placement Math: CEntityDef (0xce501483, 0x90B) stores inverse quaternions requiring conjugation; ArchetypeDefs (0x82d6fc83) uses 0xB8-byte records (+0x74/+0x7C/+0x88 hashes).",
+        "Model & Export Accuracy: topology-welded shading normals, linear-light trilinear mipmaps, watertight fixed-point rasterization, and compliant OBJ/GLB export."
+      ]
+    },
+    {
       "id": "v136-full-22-rpf-audit",
       "timestamp": "2026-11-21 11:58 UTC",
       "category": "Full Build Audit",
       "badge": "COMPLETE \u00b7 22/22 RPFs",
-      "latest": true,
+      "latest": false,
       "title": "All 22 RPFs & 48,025 Shaders Audited \u2014 26,212-Sector Grid, 833 UI RBF0s & 3,341 VFS Paths",
       "summary": "Completed full pre-EXE audit across all 22 RPF9 archives and shaders.rpf: 26,212-sector world grid PSIN (levels.rpf @0x24000), 833 RBF0 UI/GPS/gamepad files (data.rpf), 3,341 VFS mount paths + 32 vehicle meta names (common.rpf), and end-to-end verification of 26,503 SGD5 + 21,522 PS09 shaders.",
       "details": [

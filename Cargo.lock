@@ -2644,7 +2644,7 @@ dependencies = [
 
 [[package]]
 name = "rpf9_explorer"
-version = "1.4.7"
+version = "1.5.1"
 dependencies = [
  "bcpack-rs",
  "bytemuck",

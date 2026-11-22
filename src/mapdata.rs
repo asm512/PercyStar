@@ -125,13 +125,13 @@ pub fn parse_0drpz_archetype_aliases(sys: &[u8]) -> Vec<(u32, u32)> {
         let o = it + i * 16;
         let hash = ru32(sys, o);
         let sz = ru32(sys, o + 4) as usize;
-        if hash != ARCHETYPE_DEF_HASH || sz < 0x90 {
+        if hash != ARCHETYPE_DEF_HASH || sz < 0xB8 {
             continue;
         }
         let Some(base) = vptr(ru64(sys, o + 8)) else { continue };
         let end = base.saturating_add(sz).min(sys.len());
         let mut cur = base;
-        while cur + 0x90 <= end {
+        while cur + 0xB8 <= end {
             let arch = ru32(sys, cur + 0x74);
             let draw = ru32(sys, cur + 0x7C);
             let asset = ru32(sys, cur + 0x88);
@@ -141,7 +141,7 @@ pub fn parse_0drpz_archetype_aliases(sys: &[u8]) -> Vec<(u32, u32)> {
             if arch != 0 && asset != 0 && asset != arch {
                 aliases.push((arch, asset));
             }
-            cur += 0x90;
+            cur += 0xB8;
         }
     }
     aliases
@@ -174,7 +174,7 @@ fn cache_path() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    Some(base.join("PercyStar").join("world_index_v1.bin"))
+    Some(base.join("PercyStar").join("world_index_v2.bin"))
 }
 
 fn save_world_index(path: &Path, rpf_len: u64, ix: &WorldIndex) {
@@ -183,7 +183,7 @@ fn save_world_index(path: &Path, rpf_len: u64, ix: &WorldIndex) {
     }
     let Ok(f) = File::create(path) else { return };
     let mut w = BufWriter::new(f);
-    let _ = w.write_all(b"PSW1");
+    let _ = w.write_all(b"PSW2");
     let _ = w.write_all(&rpf_len.to_le_bytes());
     let _ = w.write_all(&(ix.map_count as u64).to_le_bytes());
     let _ = w.write_all(&(ix.models.len() as u64).to_le_bytes());
@@ -206,7 +206,7 @@ fn load_world_index(path: &Path, rpf_len: u64) -> Option<WorldIndex> {
     let mut r = BufReader::new(File::open(path).ok()?);
     let mut hdr = [0u8; 36];
     r.read_exact(&mut hdr).ok()?;
-    if &hdr[..4] != b"PSW1" || ru64(&hdr, 4) != rpf_len {
+    if &hdr[..4] != b"PSW2" || ru64(&hdr, 4) != rpf_len {
         return None;
     }
     let map_count = ru64(&hdr, 12) as usize;

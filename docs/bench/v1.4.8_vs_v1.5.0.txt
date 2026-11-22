@@ -1,0 +1,68 @@
+PercyStar 1.4.8 bench, best of 3, D:\Grand Theft Auto VI Build
+cache: load index                      1670.8 ms
+  (79 archives, digest 8d7d0203cea74231)
+cache: save index                      4226.8 ms
+cache: fill entry list                  555.9 ms
+search: build index                     686.5 ms
+  (index digest e76551da894bc900)
+search: query 'adder'                    54.5 ms
+  (241 hits)
+search: query 'tex_ bc7 -mip'            61.4 ms
+  (24892 hits)
+search: query 'zzzz_no_match'            57.6 ms
+  (0 hits)
+  (1324566 entries)
+scan: script.rpf                         34.5 ms
+  (1013 entries, digest 39e2de13d136ebcc)
+scan: common.rpf                         82.2 ms
+  (275 entries, digest d134b8bf5f3842d7)
+scan: textures.rpf                      248.0 ms
+  (4047 entries, digest 90c5e1929442220d)
+scan: shaders.rpf                      1347.4 ms
+  (1 entries, digest 14af23f9317e0ab6)
+scan: data.rpf                         4516.5 ms
+  (40348 entries, digest 8dbea80359262777)
+scan: packs.rpf                       40365.7 ms
+  (58220 entries, digest 9325ccd7081a2d0e)
+scan: ttdb_graphics.ttpf                  0.2 ms
+decode: 60 TTPF textures                  9.8 ms
+  (pixel digest d74dbf08781c3103)
+decode: 40 TXD dictionaries           15427.6 ms
+  (pixel digest b9ff1b3afdc7518e)
+decode: 25 packs.rpf models               6.2 ms
+  (25 decoded, (625, 800))
+PercyStar 1.5.0 bench, best of 3, D:\Grand Theft Auto VI Build
+cache: load index                       640.3 ms
+  (79 archives, digest 8d7d0203cea74231)
+cache: save index                       509.1 ms
+  (save then load gives the same index: true)
+cache: fill entry list                  450.3 ms
+search: build index                      62.1 ms
+  (index digest e76551da894bc900)
+search: query 'adder'                    12.4 ms
+  (241 hits)
+search: query 'tex_ bc7 -mip'            11.9 ms
+  (24892 hits)
+search: query 'zzzz_no_match'             9.6 ms
+  (0 hits)
+  (1324566 entries)
+scan: script.rpf                         19.8 ms
+  (1013 entries, digest 39e2de13d136ebcc)
+scan: common.rpf                         49.6 ms
+  (275 entries, digest d134b8bf5f3842d7)
+scan: textures.rpf                      234.5 ms
+  (4047 entries, digest 90c5e1929442220d)
+scan: shaders.rpf                       944.5 ms
+  (1 entries, digest 14af23f9317e0ab6)
+scan: data.rpf                         1887.2 ms
+  (40348 entries, digest 8dbea80359262777)
+scan: packs.rpf                       33297.3 ms
+  (58220 entries, digest 9325ccd7081a2d0e)
+scan: ttdb_graphics.ttpf                  0.3 ms
+decode: 60 TTPF textures                  5.1 ms
+  (pixel digest d74dbf08781c3103)
+decode: 40 TXD dictionaries            5980.3 ms
+  (pixel digest b9ff1b3afdc7518e)
+decode: 25 packs.rpf models              10.7 ms
+  (25 decoded, (625, 800))
+

@@ -196,7 +196,16 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
             let start = cam_track_bg.lock().unwrap().0;
             for e in &ix.entities {
                 let p = Vec3::from_array(e.pos);
-                let q = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]).normalize();
+                if !p.is_finite() || !e.scale_xy.is_finite() || !e.scale_z.is_finite() {
+                    continue;
+                }
+                let q_raw = Quat::from_xyzw(e.rot[0], e.rot[1], e.rot[2], e.rot[3]);
+                // e.rot is already conjugated to world space in mapdata.rs
+                let q = if !q_raw.is_finite() || q_raw.length_squared() < 1e-6 {
+                    Quat::IDENTITY
+                } else {
+                    q_raw.normalize()
+                };
                 if !ix.models.contains_key(&e.archetype_hash) {
                     if p.distance_squared(start) <= 2200.0 * 2200.0 && box_insts.len() < 12_000 {
                         let h = e.archetype_hash;
@@ -235,15 +244,30 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                 let _ = tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh: bmesh, instances: box_insts }));
             }
 
-            let all_groups: Vec<(u32, u64, Vec3, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = grouped
+            let all_groups: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = grouped
                 .into_iter()
-                .filter_map(|(h, (rep, insts))| ix.models.get(&h).map(|&moff| (h, moff, rep, insts)))
+                .filter_map(|(h, (_rep, insts))| ix.models.get(&h).map(|&moff| (h, moff, insts)))
                 .collect();
-            eprintln!("[world-gpu] {} unique drawable archetypes indexed for live camera streaming", all_groups.len());
+            // 200m spatial grid for O(cells) distance-tiered streaming up to 6 km
+            const STREAM_CELL: f32 = 200.0;
+            let mut stream_grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+            for (idx, (_, _, insts)) in all_groups.iter().enumerate() {
+                for &(p, _, _, _) in insts {
+                    let key = ((p.x / STREAM_CELL).floor() as i32, (p.y / STREAM_CELL).floor() as i32);
+                    let cell_vec = stream_grid.entry(key).or_default();
+                    if cell_vec.last().copied() != Some(idx) {
+                        cell_vec.push(idx);
+                    }
+                }
+            }
+            for v in stream_grid.values_mut() {
+                v.sort_unstable();
+                v.dedup();
+            }
+            eprintln!("[world-gpu] {} unique drawable archetypes across {} 200m cells indexed for live streaming", all_groups.len(), stream_grid.len());
 
             let mut loaded = std::collections::HashSet::<u32>::new();
             let mut last_gen = 0u64;
-            let mut total_sent = 0usize;
             loop {
                 let (cam_p, cur_gen) = *cam_track_bg.lock().unwrap();
                 if cur_gen == last_gen {
@@ -251,63 +275,102 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                     continue;
                 }
                 last_gen = cur_gen;
-                let mut nearby: Vec<(usize, f32)> = all_groups
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (h, _, _, _))| !loaded.contains(h))
-                    .filter_map(|(idx, (_, _, _, insts))| {
-                        let d2 = insts.iter().map(|i| i.0.distance_squared(cam_p)).fold(f32::MAX, f32::min);
-                        (d2 <= 3200.0 * 3200.0).then_some((idx, d2))
-                    })
-                    .collect();
-                if nearby.is_empty() {
+                let max_r = 6000.0f32;
+                let cr = (max_r / STREAM_CELL).ceil() as i32;
+                let cx0 = (cam_p.x / STREAM_CELL).floor() as i32;
+                let cy0 = (cam_p.y / STREAM_CELL).floor() as i32;
+                let mut cells: Vec<((i32, i32), f32)> = Vec::new();
+                for dx in -cr..=cr {
+                    for dy in -cr..=cr {
+                        let key = (cx0 + dx, cy0 + dy);
+                        if !stream_grid.contains_key(&key) {
+                            continue;
+                        }
+                        let x0 = key.0 as f32 * STREAM_CELL;
+                        let y0 = key.1 as f32 * STREAM_CELL;
+                        let rx = (x0 - cam_p.x).max(0.0).max(cam_p.x - (x0 + STREAM_CELL));
+                        let ry = (y0 - cam_p.y).max(0.0).max(cam_p.y - (y0 + STREAM_CELL));
+                        let d2 = rx * rx + ry * ry;
+                        if d2 <= max_r * max_r {
+                            cells.push((key, d2));
+                        }
+                    }
+                }
+                cells.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+                let take_n = if loaded.is_empty() { 1200 } else { 500 };
+                let mut seen_idx = std::collections::HashSet::new();
+                let mut batch_list: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = Vec::with_capacity(take_n);
+                'outer: for (key, _) in cells {
+                    if let Some(indices) = stream_grid.get(&key) {
+                        for &idx in indices {
+                            let (h, moff, ref insts) = all_groups[idx];
+                            if loaded.contains(&h) || !seen_idx.insert(idx) {
+                                continue;
+                            }
+                            batch_list.push((h, moff, insts.clone()));
+                            if batch_list.len() >= take_n {
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                if batch_list.is_empty() {
                     continue;
                 }
-                nearby.sort_by(|a, b| a.1.total_cmp(&b.1));
-                let take_n = nearby.len().min(if total_sent == 0 { 1200 } else { 500 });
-                let batch_list: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = nearby
-                    .into_iter()
-                    .take(take_n)
-                    .map(|(idx, _)| {
-                        let (h, moff, _, ref insts) = all_groups[idx];
-                        loaded.insert(h);
-                        (h, moff, insts.clone())
-                    })
-                    .collect();
-                total_sent += batch_list.len();
-                let _ = tx.send(WorldStreamMsg::TotalArchetypes(total_sent));
+                let _ = tx.send(WorldStreamMsg::TotalArchetypes(loaded.len() + batch_list.len()));
                 let groups = Arc::new(batch_list);
                 let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                std::thread::scope(|s| {
-                    for _ in 0..3 {
-                        let groups = Arc::clone(&groups);
-                        let cursor = Arc::clone(&cursor);
-                        let tx = tx.clone();
-                        let lp = lp.clone();
-                        let cam_track_bg = Arc::clone(&cam_track_bg);
-                        s.spawn(move || loop {
-                            if cam_track_bg.lock().unwrap().1 != last_gen {
-                                break;
-                            }
-                            let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if i >= groups.len() {
-                                break;
-                            }
-                            let (h, moff, ref insts) = groups[i];
-                            if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
-                                let lo = mesh.name.to_ascii_lowercase();
-                                if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy"))
-                                    && tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
+                let workers = std::thread::available_parallelism().map(|n| (n.get() / 2).clamp(3, 6)).unwrap_or(3);
+                // a camera move stops the batch early and whatever was not reached is queued again
+                let mut finished_count = 0usize;
+                let worker_done: Vec<Vec<u32>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = (0..workers)
+                        .map(|_| {
+                            let groups = Arc::clone(&groups);
+                            let cursor = Arc::clone(&cursor);
+                            let tx = tx.clone();
+                            let lp = lp.clone();
+                            let cam_track_bg = Arc::clone(&cam_track_bg);
+                            s.spawn(move || {
+                                // the viewer shows these at 128 pixels so larger mips are never read
+                                crate::tex::set_thread_texture_cap(128);
+                                let mut local_done = Vec::new();
+                                loop {
+                                    if cam_track_bg.lock().unwrap().1 != last_gen {
                                         break;
                                     }
-                            }
-                            if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(1));
-                        });
-                    }
+                                    let i = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if i >= groups.len() {
+                                        break;
+                                    }
+                                    let (h, moff, ref insts) = groups[i];
+                                    if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
+                                        let lo = mesh.name.to_ascii_lowercase();
+                                        if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy"))
+                                            && tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
+                                                break;
+                                            }
+                                    }
+                                    local_done.push(h);
+                                    if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
+                                        break;
+                                    }
+                                }
+                                local_done
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
                 });
+                for chunk in worker_done {
+                    finished_count += chunk.len();
+                    loaded.extend(chunk);
+                }
+                if finished_count < groups.len() {
+                    // let the next pass run even if the camera has stopped moving again
+                    last_gen = 0;
+                }
+                let _ = tx.send(WorldStreamMsg::TotalArchetypes(loaded.len()));
             }
         });
     }
@@ -612,10 +675,13 @@ struct GpuMeshBatch {
     inst_buf: wgpu::Buffer,
     index_count: u32,
     index_format: wgpu::IndexFormat,
+    inst_first: u32,
     inst_count: u32,
     tex_bind_group: wgpu::BindGroup,
     bound_center: Vec3,
     bound_radius: f32,
+    // radius of one placed copy, decides draw distance and shadow casting
+    obj_radius: f32,
     is_box: bool,
     is_terrain: bool,
 }
@@ -653,6 +719,9 @@ struct GpuState {
     tex_bytes: usize,
     geom_bytes: usize,
     vram_oom: bool,
+    // texture bind groups by pixel buffer address with the textures kept alive behind them
+    tex_uploads: HashMap<usize, wgpu::BindGroup>,
+    tex_keep: Vec<Arc<crate::model3d::Texture2D>>,
     frame_idx: u64,
     start_instant: Instant,
     has_hw_rt: bool,
@@ -1089,6 +1158,8 @@ impl GpuState {
             tex_bytes: 0,
             geom_bytes: 0,
             vram_oom: false,
+            tex_uploads: HashMap::new(),
+            tex_keep: Vec::new(),
             frame_idx: 0,
             start_instant: Instant::now(),
             has_hw_rt,
@@ -1135,8 +1206,12 @@ impl GpuState {
         }
 
         let normals = compute_smooth_normals(&b.mesh);
-        let insts: Vec<GpuInstance> = b
-            .instances
+        // placements of one model can span the whole map, sorting them by cell lets each cell be culled on its own
+        const CELL: f32 = 1024.0;
+        let cell_of = |p: Vec3| ((p.x / CELL).floor() as i32, (p.y / CELL).floor() as i32, (p.z / CELL).floor() as i32);
+        let mut placed = b.instances.clone();
+        placed.sort_by_key(|i| cell_of(i.0));
+        let insts: Vec<GpuInstance> = placed
             .iter()
             .map(|&(pos, rot, scale, col)| GpuInstance::from_mat4(Mat4::from_scale_rotation_translation(scale, rot, pos), col))
             .collect();
@@ -1210,46 +1285,69 @@ impl GpuState {
         }
         let local_center = (lmin + lmax) * 0.5;
         let local_rad = ((lmax - lmin) * 0.5).length();
-        let mut wmin = Vec3::splat(f32::MAX);
-        let mut wmax = Vec3::splat(f32::MIN);
-        for &(pos, rot, scale, _) in &b.instances {
-            let c = pos + rot * (local_center * scale);
-            let r = local_rad * scale.abs().max_element();
-            wmin = wmin.min(c - Vec3::splat(r));
-            wmax = wmax.max(c + Vec3::splat(r));
+        // one entry per run of placements in the same cell: first instance, count, bounds, largest copy
+        let mut cells: Vec<(u32, u32, Vec3, f32, f32)> = Vec::new();
+        let mut start = 0usize;
+        while start < placed.len() {
+            let key = cell_of(placed[start].0);
+            let mut end = start;
+            let mut wmin = Vec3::splat(f32::MAX);
+            let mut wmax = Vec3::splat(f32::MIN);
+            let mut obj_radius = 0.0f32;
+            while end < placed.len() && cell_of(placed[end].0) == key {
+                let (pos, rot, scale, _) = placed[end];
+                let c = pos + rot * (local_center * scale);
+                let r = local_rad * scale.abs().max_element();
+                wmin = wmin.min(c - Vec3::splat(r));
+                wmax = wmax.max(c + Vec3::splat(r));
+                obj_radius = obj_radius.max(r);
+                end += 1;
+            }
+            cells.push((start as u32, (end - start) as u32, (wmin + wmax) * 0.5, ((wmax - wmin) * 0.5).length().max(1.0), obj_radius.max(1.0)));
+            start = end;
         }
-        let bound_center = (wmin + wmax) * 0.5;
-        let bound_radius = ((wmax - wmin) * 0.5).length().max(1.0);
 
         for (g, index_count, ib) in ibs {
-            let tex_bg = if self.tex_bytes < 512 * 1024 * 1024 {
-                b.mesh
-                    .texture
-                    .as_ref()
-                    .or_else(|| b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.as_deref()))
-                    .map(|t| {
-                        let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128);
-                        self.tex_bytes += bytes;
-                        bg
-                    })
-                    .unwrap_or_else(|| self.white_bg.clone())
-            } else {
-                self.white_bg.clone()
+            let shared = if b.mesh.texture.is_some() { None } else { b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.clone()) };
+            let tex = b.mesh.texture.as_ref().or(shared.as_deref());
+            let tex_bg = match tex {
+                Some(t) if self.tex_bytes < 512 * 1024 * 1024 => {
+                    // materials that share a decoded texture share one upload
+                    let key = t.pixels.as_ptr() as usize;
+                    match self.tex_uploads.get(&key).filter(|_| shared.is_some()) {
+                        Some(bg) => bg.clone(),
+                        None => {
+                            let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128);
+                            self.tex_bytes += bytes;
+                            if let Some(keep) = shared.clone() {
+                                // holding the texture keeps its address from being reused by another one
+                                self.tex_keep.push(keep);
+                                self.tex_uploads.insert(key, bg.clone());
+                            }
+                            bg
+                        }
+                    }
+                }
+                _ => self.white_bg.clone(),
             };
 
-            self.batches.push(GpuMeshBatch {
-                vb: vb.clone(),
-                ib,
-                inst_buf: inst_buf.clone(),
-                index_count,
-                index_format: idx_fmt,
-                inst_count: insts.len() as u32,
-                tex_bind_group: tex_bg,
-                bound_center,
-                bound_radius,
-                is_box: b.mesh.name == "__placeholder_boxes__",
-                is_terrain,
-            });
+            for &(inst_first, inst_count, bound_center, bound_radius, obj_radius) in &cells {
+                self.batches.push(GpuMeshBatch {
+                    vb: vb.clone(),
+                    ib: ib.clone(),
+                    inst_buf: inst_buf.clone(),
+                    index_count,
+                    index_format: idx_fmt,
+                    inst_first,
+                    inst_count,
+                    tex_bind_group: tex_bg.clone(),
+                    bound_center,
+                    bound_radius,
+                    obj_radius,
+                    is_box: b.mesh.name == "__placeholder_boxes__",
+                    is_terrain,
+                });
+            }
         }
 
         self.geom_bytes += est_geom_bytes;
@@ -1291,6 +1389,8 @@ struct GpuWorldApp {
     menu_open: bool,
     show_models: bool,
     show_boxes: bool,
+    show_water: bool,
+    draw_radius: f32,
     fog_density: f32,
     exposure: f32,
     keys: [bool; 9], // W A S D Q E Shift Space Ctrl
@@ -1326,6 +1426,8 @@ impl GpuWorldApp {
             menu_open: true,
             show_models: true,
             show_boxes: false,
+            show_water: true,
+            draw_radius: 6000.0,
             fog_density: 0.70,
             exposure: 1.0,
             keys: [false; 9],
@@ -1454,13 +1556,14 @@ impl ApplicationHandler for GpuWorldApp {
                         KeyCode::KeyA => self.keys[1] = down,
                         KeyCode::KeyS => self.keys[2] = down,
                         KeyCode::KeyD => self.keys[3] = down,
-                        KeyCode::KeyQ => self.keys[4] = down,
+                        KeyCode::KeyQ | KeyCode::KeyC => self.keys[4] = down,
                         KeyCode::KeyE => self.keys[5] = down,
                         KeyCode::ShiftLeft | KeyCode::ShiftRight => self.keys[6] = down,
                         KeyCode::Space => self.keys[7] = down,
                         KeyCode::ControlLeft | KeyCode::ControlRight => self.keys[8] = down,
                         KeyCode::Home | KeyCode::F1 if down => self.menu_open = !self.menu_open,
                         KeyCode::KeyB if down => self.show_boxes = !self.show_boxes,
+                        KeyCode::KeyV if down => self.show_water = !self.show_water,
                         KeyCode::F6 if down => self.auto_sun = !self.auto_sun,
                         KeyCode::KeyR if down => self.rt_on = !self.rt_on,
                         KeyCode::KeyG if down => {
@@ -1610,7 +1713,7 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.set_pipeline(&g.shadow_pipeline);
                     rp.set_bind_group(0, &g.uniform_bg, &[]);
                     for b in &g.batches {
-                        if b.bound_radius < 3.0 {
+                        if b.obj_radius < 3.0 {
                             continue;
                         }
                         if b.bound_radius < 5000.0 && (b.bound_center - light_target).length_squared() > (1200.0 + b.bound_radius).powi(2) {
@@ -1620,7 +1723,7 @@ impl ApplicationHandler for GpuWorldApp {
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
                         rp.set_index_buffer(b.ib.slice(..), b.index_format);
-                        rp.draw_indexed(0..b.index_count, 0, 0..b.inst_count);
+                        rp.draw_indexed(0..b.index_count, 0, b.inst_first..b.inst_first + b.inst_count);
                     }
                 }
 
@@ -1647,7 +1750,7 @@ impl ApplicationHandler for GpuWorldApp {
                     rp.draw(0..3, 0..1);
 
                     // Smoke checks must not mistake the ocean plane for loaded geometry.
-                    if self.smoke_frames.is_none() {
+                    if self.smoke_frames.is_none() && self.show_water {
                         rp.set_pipeline(&g.water_pipeline);
                         rp.draw(0..6, 0..1);
                     }
@@ -1667,12 +1770,13 @@ impl ApplicationHandler for GpuWorldApp {
                                 continue;
                             }
                             let d2 = to_b.length_squared();
-                            let max_d = if b.bound_radius > 35.0 { 6500.0 } else if b.bound_radius < 2.0 { 450.0 } else { 3200.0 };
+                            let base_d: f32 = if b.obj_radius > 35.0 { 6500.0 } else if b.obj_radius < 2.0 { 450.0 } else { 3200.0 };
+                            let max_d = base_d.min(self.draw_radius).max(if b.obj_radius > 35.0 { self.draw_radius } else { 450.0 });
                             if d2 > (max_d + b.bound_radius).powi(2) {
                                 continue;
                             }
                             drawn += 1;
-                            if drawn > 1400 {
+                            if drawn > 6000 {
                                 break;
                             }
                         }
@@ -1680,7 +1784,7 @@ impl ApplicationHandler for GpuWorldApp {
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
                         rp.set_index_buffer(b.ib.slice(..), b.index_format);
-                        rp.draw_indexed(0..b.index_count, 0, 0..b.inst_count);
+                        rp.draw_indexed(0..b.index_count, 0, b.inst_first..b.inst_first + b.inst_count);
                     }
 
                     rp.set_pipeline(&g.minimap_pipeline);
@@ -1736,11 +1840,28 @@ impl ApplicationHandler for GpuWorldApp {
                             );
                             ui.separator();
                             ui.add(eframe::egui::Slider::new(&mut self.time_h, 0.0..=24.0).text("Time of Day (h)"));
+                            ui.horizontal(|ui| {
+                                for (lbl, h) in [("Dawn", 6.2), ("Noon", 12.5), ("Golden", 18.0), ("Night", 23.0)] {
+                                    if ui.small_button(lbl).clicked() {
+                                        self.time_h = h;
+                                        self.auto_sun = false;
+                                    }
+                                }
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Radius:");
+                                for (lbl, r) in [("700m", 700.0), ("1.5km", 1500.0), ("3km", 3000.0), ("6km", 6000.0), ("16km", 16000.0)] {
+                                    if ui.selectable_label((self.draw_radius - r).abs() < 1.0, lbl).clicked() {
+                                        self.draw_radius = r;
+                                    }
+                                }
+                            });
                             ui.add(eframe::egui::Slider::new(&mut self.fog_density, 0.0..=2.0).text("Fog Density"));
                             ui.add(eframe::egui::Slider::new(&mut self.exposure, 0.3..=2.2).text("Exposure"));
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut self.auto_sun, "Auto Sun (F6)");
                                 ui.checkbox(&mut self.rt_on, "RT Shadows (R)");
+                                ui.checkbox(&mut self.show_water, "Water (V)");
                             });
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut self.show_models, "Real Models");
