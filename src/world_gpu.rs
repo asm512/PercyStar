@@ -76,8 +76,223 @@ pub struct WorldLaunchConfig {
     pub start_pos: [f32; 3],
 }
 
+// index list of one material group already in the width the gpu buffer uses
+pub enum PreparedIndices {
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+}
+
+impl PreparedIndices {
+    fn len(&self) -> usize {
+        match self {
+            Self::U16(v) => v.len(),
+            Self::U32(v) => v.len(),
+        }
+    }
+
+    fn format(&self) -> wgpu::IndexFormat {
+        match self {
+            Self::U16(_) => wgpu::IndexFormat::Uint16,
+            Self::U32(_) => wgpu::IndexFormat::Uint32,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::U16(v) => bytemuck::cast_slice(v),
+            Self::U32(v) => bytemuck::cast_slice(v),
+        }
+    }
+}
+
+pub struct PreparedGeom {
+    pub indices: PreparedIndices,
+    // decoded texture shared with other materials and models, none when the mesh carries its own
+    pub texture: Option<Arc<Texture2D>>,
+}
+
+// one run of placements in the same map cell
+pub struct PreparedCell {
+    pub inst_first: u32,
+    pub inst_count: u32,
+    pub bound_center: Vec3,
+    pub bound_radius: f32,
+    // radius of the largest placed copy in the cell
+    pub obj_radius: f32,
+}
+
+// cpu side of one model built off the render thread, only buffers and bind groups are left to create
+pub struct PreparedBatch {
+    // streamed models carry their archetype so the streamer can be told when they are dropped
+    pub archetype: Option<u32>,
+    pub is_terrain: bool,
+    pub is_box: bool,
+    pub verts: Vec<GpuVertex>,
+    pub insts: Vec<GpuInstance>,
+    pub geoms: Vec<PreparedGeom>,
+    pub cells: Vec<PreparedCell>,
+    pub own_texture: Option<Texture2D>,
+    pub tri_count: usize,
+    pub geom_bytes: usize,
+}
+
+// placements of one model can span the whole map, sorting them by cell lets each cell be culled on its own
+const BATCH_CELL: f32 = 1024.0;
+
+// smooth normals, vertex and index data, cell sorted instances and their bounds
+pub fn prepare_batch(b: WorldBatchInput, archetype: Option<u32>) -> Option<PreparedBatch> {
+    let WorldBatchInput { mut mesh, instances: mut placed } = b;
+    if mesh.verts.is_empty() || mesh.tris.is_empty() || placed.is_empty() {
+        return None;
+    }
+    let use_u16 = mesh.verts.len() <= u16::MAX as usize;
+    let geom_bytes = mesh.verts.len() * std::mem::size_of::<GpuVertex>()
+        + mesh.tris.len() * if use_u16 { 6 } else { 12 }
+        + placed.len() * std::mem::size_of::<GpuInstance>();
+
+    let normals = compute_smooth_normals(&mesh);
+    let cell_of = |p: Vec3| ((p.x / BATCH_CELL).floor() as i32, (p.y / BATCH_CELL).floor() as i32, (p.z / BATCH_CELL).floor() as i32);
+    placed.sort_by_key(|i| cell_of(i.0));
+    let insts: Vec<GpuInstance> = placed
+        .iter()
+        .map(|&(pos, rot, scale, col)| GpuInstance::from_mat4(Mat4::from_scale_rotation_translation(scale, rot, pos), col))
+        .collect();
+
+    // splits mesh3d by tri_geom material so every ttpf texture and paint group renders cleanly
+    let own_texture = mesh.texture.take();
+    let mut by_geom: std::collections::BTreeMap<u16, Vec<u32>> = std::collections::BTreeMap::new();
+    for (ti, &[i0, i1, i2]) in mesh.tris.iter().enumerate() {
+        let g = if own_texture.is_some() { 0 } else { mesh.tri_geom.get(ti).copied().unwrap_or(0) };
+        let v = by_geom.entry(g).or_default();
+        v.push(i0);
+        v.push(i1);
+        v.push(i2);
+    }
+    let geoms: Vec<PreparedGeom> = by_geom
+        .into_iter()
+        .map(|(g, indices)| PreparedGeom {
+            indices: if use_u16 {
+                PreparedIndices::U16(indices.iter().map(|&i| i as u16).collect())
+            } else {
+                PreparedIndices::U32(indices)
+            },
+            texture: if own_texture.is_some() { None } else { mesh.geom_materials.get(g as usize).and_then(|m| m.texture.clone()) },
+        })
+        .collect();
+
+    let verts: Vec<GpuVertex> = mesh
+        .verts
+        .iter()
+        .enumerate()
+        .map(|(i, &pos)| GpuVertex {
+            pos,
+            normal: normals[i],
+            uv: mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+        })
+        .collect();
+
+    let mut lmin = Vec3::splat(f32::MAX);
+    let mut lmax = Vec3::splat(f32::MIN);
+    for v in &mesh.verts {
+        let p = Vec3::from_array(*v);
+        lmin = lmin.min(p);
+        lmax = lmax.max(p);
+    }
+    let local_center = (lmin + lmax) * 0.5;
+    let local_rad = ((lmax - lmin) * 0.5).length();
+    // one entry per run of placements in the same cell: first instance, count, bounds, largest copy
+    let mut cells: Vec<PreparedCell> = Vec::new();
+    let mut start = 0usize;
+    while start < placed.len() {
+        let key = cell_of(placed[start].0);
+        let mut end = start;
+        let mut wmin = Vec3::splat(f32::MAX);
+        let mut wmax = Vec3::splat(f32::MIN);
+        let mut obj_radius = 0.0f32;
+        while end < placed.len() && cell_of(placed[end].0) == key {
+            let (pos, rot, scale, _) = placed[end];
+            let c = pos + rot * (local_center * scale);
+            let r = local_rad * scale.abs().max_element();
+            wmin = wmin.min(c - Vec3::splat(r));
+            wmax = wmax.max(c + Vec3::splat(r));
+            obj_radius = obj_radius.max(r);
+            end += 1;
+        }
+        cells.push(PreparedCell {
+            inst_first: start as u32,
+            inst_count: (end - start) as u32,
+            bound_center: (wmin + wmax) * 0.5,
+            bound_radius: ((wmax - wmin) * 0.5).length().max(1.0),
+            obj_radius: obj_radius.max(1.0),
+        });
+        start = end;
+    }
+
+    Some(PreparedBatch {
+        archetype,
+        is_terrain: mesh.name == "mhiu_world_terrain",
+        is_box: mesh.name == "__placeholder_boxes__",
+        verts,
+        insts,
+        geoms,
+        cells,
+        own_texture,
+        tri_count: mesh.tris.len(),
+        geom_bytes,
+    })
+}
+
+const MAX_GEOM_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_TEX_BYTES: usize = 512 * 1024 * 1024;
+// archetype the viewer let go of and the camera position at that moment
+// an evicted one carries the distance it may load again within, a model turned away for lack of room carries none and is offered again right away
+type UnloadNotice = (u32, Vec3, Option<f32>);
+// an evicted model loads again once the camera is this much closer than where it was dropped
+const RELOAD_STEP: f32 = 150.0;
+// one dropped beyond its draw range also waits until it is this near to that range
+const RELOAD_MARGIN: f32 = 200.0;
+// eviction starts above the high mark and stops under the low one, both in percent of the geometry budget
+const EVICT_HIGH_PCT: usize = 85;
+const EVICT_LOW_PCT: usize = 65;
+// a model has to stay undrawn this many frames before it can go
+const EVICT_IDLE_FRAMES: u64 = 600;
+// a freshly loaded model only gets this many frames to show up
+const EVICT_FRESH_FRAMES: u64 = 30;
+
+struct EvictCandidate {
+    owner: u32,
+    bytes: usize,
+    last_drawn: u64,
+    // distance from the camera to the nearest placement bounds
+    dist: f32,
+    // terrain, placeholder boxes and anything the streamer could not load again
+    pinned: bool,
+}
+
+// owners to drop once geometry passes the high mark: idle ones only, farthest first, until under the low mark
+fn select_evictions(cands: &[EvictCandidate], total_bytes: usize, frame: u64, high: usize, low: usize, idle_frames: u64) -> Vec<u32> {
+    if total_bytes <= high {
+        return Vec::new();
+    }
+    let mut idle: Vec<&EvictCandidate> = cands
+        .iter()
+        .filter(|c| !c.pinned && frame.saturating_sub(c.last_drawn) > idle_frames)
+        .collect();
+    idle.sort_by(|a, b| b.dist.total_cmp(&a.dist));
+    let mut left = total_bytes;
+    let mut out = Vec::new();
+    for c in idle {
+        if left <= low {
+            break;
+        }
+        left = left.saturating_sub(c.bytes);
+        out.push(c.owner);
+    }
+    out
+}
+
 pub enum WorldStreamMsg {
-    Batch(WorldBatchInput),
+    Batch(PreparedBatch),
     MapCount(usize),
     TotalArchetypes(usize),
     ArchetypeDone,
@@ -176,14 +391,19 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
     let (tx, rx) = mpsc::sync_channel(16);
     let cam_track = Arc::new(std::sync::Mutex::new((Vec3::from_array(cfg.start_pos), 1u64)));
     let cam_track_bg = Arc::clone(&cam_track);
+    // archetypes the viewer dropped or had no room for, see unload notice
+    let (unload_tx, unload_rx) = mpsc::channel::<UnloadNotice>();
     if let Some(lp) = cfg.levels_rpf.clone() {
         std::thread::spawn(move || {
             // 1. fast-load brickell slod city blocks immediately
             if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, 8_679_358_480, "brickell_slod") {
-                let _ = tx.send(WorldStreamMsg::Batch(WorldBatchInput {
+                let slod = WorldBatchInput {
                     mesh,
                     instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
-                }));
+                };
+                if let Some(p) = prepare_batch(slod, None) {
+                    let _ = tx.send(WorldStreamMsg::Batch(p));
+                }
             }
             // 2. build/load cached 0DRPz map placements + model index
             eprintln!("[world-gpu] loading/building world index from {}", lp.display());
@@ -241,7 +461,9 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                     0,
                     "BOX".into(),
                 );
-                let _ = tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh: bmesh, instances: box_insts }));
+                if let Some(p) = prepare_batch(WorldBatchInput { mesh: bmesh, instances: box_insts }, None) {
+                    let _ = tx.send(WorldStreamMsg::Batch(p));
+                }
             }
 
             let all_groups: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = grouped
@@ -265,8 +487,20 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                 v.dedup();
             }
             eprintln!("[world-gpu] {} unique drawable archetypes across {} 200m cells indexed for live streaming", all_groups.len(), stream_grid.len());
+            let group_of: HashMap<u32, usize> = all_groups.iter().enumerate().map(|(idx, g)| (g.0, idx)).collect();
+            // squared distance from a point to the 200m cell that holds p
+            let cell_d2 = |p: Vec3, from: Vec3| {
+                let x0 = (p.x / STREAM_CELL).floor() * STREAM_CELL;
+                let y0 = (p.y / STREAM_CELL).floor() * STREAM_CELL;
+                let rx = (x0 - from.x).max(0.0).max(from.x - (x0 + STREAM_CELL));
+                let ry = (y0 - from.y).max(0.0).max(from.y - (y0 + STREAM_CELL));
+                rx * rx + ry * ry
+            };
 
             let mut loaded = std::collections::HashSet::<u32>::new();
+            // how near the camera has to be before a dropped archetype is decoded again
+            let mut reload_within: HashMap<u32, f32> = HashMap::new();
+            let mut done_count = 0usize;
             let mut last_gen = 0u64;
             loop {
                 let (cam_p, cur_gen) = *cam_track_bg.lock().unwrap();
@@ -275,6 +509,16 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                     continue;
                 }
                 last_gen = cur_gen;
+                // dropped archetypes may load again once the camera comes back
+                while let Ok((h, at, hold)) = unload_rx.try_recv() {
+                    loaded.remove(&h);
+                    reload_within.remove(&h);
+                    if let (Some(limit), Some(&idx)) = (hold, group_of.get(&h)) {
+                        // loading it back at the distance it was dropped at would only get it dropped again
+                        let d2 = all_groups[idx].2.iter().map(|i| cell_d2(i.0, at)).fold(f32::MAX, f32::min);
+                        reload_within.insert(h, (d2.sqrt() - RELOAD_STEP).max(0.0).min(limit));
+                    }
+                }
                 let max_r = 6000.0f32;
                 let cr = (max_r / STREAM_CELL).ceil() as i32;
                 let cx0 = (cam_p.x / STREAM_CELL).floor() as i32;
@@ -300,11 +544,15 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                 let take_n = if loaded.is_empty() { 1200 } else { 500 };
                 let mut seen_idx = std::collections::HashSet::new();
                 let mut batch_list: Vec<(u32, u64, Vec<(Vec3, Quat, Vec3, [f32; 4])>)> = Vec::with_capacity(take_n);
-                'outer: for (key, _) in cells {
+                'outer: for (key, d2) in cells {
                     if let Some(indices) = stream_grid.get(&key) {
                         for &idx in indices {
                             let (h, moff, ref insts) = all_groups[idx];
                             if loaded.contains(&h) || !seen_idx.insert(idx) {
+                                continue;
+                            }
+                            // cells come nearest first so this is the closest the model gets in this pass
+                            if reload_within.get(&h).is_some_and(|&r| d2.sqrt() > r) {
                                 continue;
                             }
                             batch_list.push((h, moff, insts.clone()));
@@ -317,7 +565,8 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                 if batch_list.is_empty() {
                     continue;
                 }
-                let _ = tx.send(WorldStreamMsg::TotalArchetypes(loaded.len() + batch_list.len()));
+                // counted by finished decodes, the loaded set shrinks when the viewer drops models
+                let _ = tx.send(WorldStreamMsg::TotalArchetypes(done_count + batch_list.len()));
                 let groups = Arc::new(batch_list);
                 let cursor = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                 let workers = std::thread::available_parallelism().map(|n| (n.get() / 2).clamp(3, 6)).unwrap_or(3);
@@ -346,10 +595,14 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                                     let (h, moff, ref insts) = groups[i];
                                     if let Ok(mesh) = crate::model3d::decode_rage9_model_from_rpf(&lp, moff, &format!("arch_{h:08x}")) {
                                         let lo = mesh.name.to_ascii_lowercase();
-                                        if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy"))
-                                            && tx.send(WorldStreamMsg::Batch(WorldBatchInput { mesh, instances: insts.clone() })).is_err() {
-                                                break;
+                                        if !(lo.ends_with("_shadow") || lo.ends_with("_pxy") || lo.ends_with("_lit_proxy")) {
+                                            // normals, buffers and cell bounds are built here so the render thread only uploads
+                                            if let Some(p) = prepare_batch(WorldBatchInput { mesh, instances: insts.clone() }, Some(h)) {
+                                                if tx.send(WorldStreamMsg::Batch(p)).is_err() {
+                                                    break;
+                                                }
                                             }
+                                        }
                                     }
                                     local_done.push(h);
                                     if tx.send(WorldStreamMsg::ArchetypeDone).is_err() {
@@ -366,15 +619,16 @@ pub fn run_gpu_world_cli(common_rpf: Option<&Path>, levels_rpf: Option<&Path>) -
                     finished_count += chunk.len();
                     loaded.extend(chunk);
                 }
+                done_count += finished_count;
                 if finished_count < groups.len() {
                     // let the next pass run even if the camera has stopped moving again
                     last_gen = 0;
                 }
-                let _ = tx.send(WorldStreamMsg::TotalArchetypes(loaded.len()));
+                let _ = tx.send(WorldStreamMsg::TotalArchetypes(done_count));
             }
         });
     }
-    let mut app = GpuWorldApp::new(cfg, rx, cam_track);
+    let mut app = GpuWorldApp::new(cfg, rx, cam_track, unload_tx);
     event_loop.run_app(&mut app).map_err(|e| format!("GPU event loop failed: {e}"))?;
     match app.failure { Some(error) => Err(error), None => Ok(()) }
 }
@@ -684,6 +938,32 @@ struct GpuMeshBatch {
     obj_radius: f32,
     is_box: bool,
     is_terrain: bool,
+    // every batch made from one model shares this id
+    owner: u32,
+}
+
+// bookkeeping of one loaded model so it can be dropped as a whole
+struct LoadedModel {
+    // only streamed archetypes can be loaded again, everything else stays for good
+    archetype: Option<u32>,
+    geom_bytes: usize,
+    tris: usize,
+    instances: usize,
+    last_drawn: u64,
+    // bytes of the texture only this model uses
+    own_tex_bytes: usize,
+    // one upload cache key per material that uses a shared texture
+    tex_keys: Vec<usize>,
+}
+
+// one cached upload with the decoded texture kept alive behind it
+struct SharedTex {
+    bg: wgpu::BindGroup,
+    // holding the texture keeps its address from being reused by another one
+    _keep: Arc<Texture2D>,
+    bytes: usize,
+    // materials of loaded models that draw with it
+    users: u32,
 }
 
 struct GpuState {
@@ -710,6 +990,16 @@ struct GpuState {
     minimap_bg: wgpu::BindGroup,
     egui_renderer: egui_wgpu::Renderer,
     batches: Vec<GpuMeshBatch>,
+    models: HashMap<u32, LoadedModel>,
+    // owner id of every loaded streamed archetype
+    by_archetype: HashMap<u32, u32>,
+    next_owner: u32,
+    // archetypes dropped or turned away since the streamer was last told, with the reload limit of the unload notice
+    unloaded: Vec<(u32, Option<f32>)>,
+    next_evict_check: u64,
+    // smoke scenes shrink these to reach eviction with a handful of models
+    geom_budget: usize,
+    evict_idle_frames: u64,
     tri_count: usize,
     instance_count: usize,
     model_count: usize,
@@ -719,9 +1009,8 @@ struct GpuState {
     tex_bytes: usize,
     geom_bytes: usize,
     vram_oom: bool,
-    // texture bind groups by pixel buffer address with the textures kept alive behind them
-    tex_uploads: HashMap<usize, wgpu::BindGroup>,
-    tex_keep: Vec<Arc<crate::model3d::Texture2D>>,
+    // texture bind groups by pixel buffer address
+    tex_uploads: HashMap<usize, SharedTex>,
     frame_idx: u64,
     start_instant: Instant,
     has_hw_rt: bool,
@@ -801,6 +1090,12 @@ fn upload_texture(
     (bg, bytes)
 }
 
+// how far from the camera a placed copy of this size is still drawn
+fn draw_dist(obj_radius: f32, draw_radius: f32) -> f32 {
+    let base_d: f32 = if obj_radius > 35.0 { 6500.0 } else if obj_radius < 2.0 { 450.0 } else { 3200.0 };
+    base_d.min(draw_radius).max(if obj_radius > 35.0 { draw_radius } else { 450.0 })
+}
+
 fn compute_smooth_normals(mesh: &Mesh3D) -> Vec<[f32; 3]> {
     let mut accum = vec![Vec3::ZERO; mesh.verts.len()];
     for (ti, &[a, b, c]) in mesh.tris.iter().enumerate() {
@@ -820,7 +1115,7 @@ fn compute_smooth_normals(mesh: &Mesh3D) -> Vec<[f32; 3]> {
 }
 
 impl GpuState {
-    fn new(window: Arc<Window>, cfg: &WorldLaunchConfig) -> Self {
+    fn new(window: Arc<Window>, cfg: WorldLaunchConfig) -> Self {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
@@ -1149,6 +1444,13 @@ impl GpuState {
             minimap_bg,
             egui_renderer,
             batches: Vec::new(),
+            models: HashMap::new(),
+            by_archetype: HashMap::new(),
+            next_owner: 0,
+            unloaded: Vec::new(),
+            next_evict_check: 0,
+            geom_budget: MAX_GEOM_BYTES,
+            evict_idle_frames: EVICT_IDLE_FRAMES,
             tri_count: 0,
             instance_count: 0,
             model_count: 0,
@@ -1159,7 +1461,6 @@ impl GpuState {
             geom_bytes: 0,
             vram_oom: false,
             tex_uploads: HashMap::new(),
-            tex_keep: Vec::new(),
             frame_idx: 0,
             start_instant: Instant::now(),
             has_hw_rt,
@@ -1176,96 +1477,61 @@ impl GpuState {
                 st.minimap_bg = mbg;
                 st.tex_bytes += bytes;
             }
-            st.add_batch(&WorldBatchInput {
+            st.add_batch(WorldBatchInput {
                 mesh: tmesh,
                 instances: vec![(Vec3::ZERO, Quat::IDENTITY, Vec3::ONE, [1.0; 4])],
             });
             st.model_count = st.model_count.saturating_sub(1);
         }
 
-        for b in &cfg.batches {
+        for b in cfg.batches {
             st.add_batch(b);
         }
         st
     }
 
-    // splits mesh3d by tri_geom material so every ttpf texture and paint group renders cleanly
-    fn add_batch(&mut self, b: &WorldBatchInput) {
-        if b.mesh.verts.is_empty() || b.mesh.tris.is_empty() || b.instances.is_empty() {
+    // prepares on the calling thread, for the terrain and the batches handed over at launch
+    fn add_batch(&mut self, b: WorldBatchInput) {
+        if let Some(p) = prepare_batch(b, None) {
+            self.add_prepared(p);
+        }
+    }
+
+    // gpu side of a prepared model: buffers, texture bind groups and one draw batch per material and cell
+    fn add_prepared(&mut self, p: PreparedBatch) {
+        if p.archetype.is_some_and(|h| self.by_archetype.contains_key(&h)) {
             return;
         }
-        const MAX_GEOM_BYTES: usize = 1024 * 1024 * 1024;
-        let is_terrain = b.mesh.name == "mhiu_world_terrain";
-        let use_u16 = b.mesh.verts.len() <= u16::MAX as usize;
-        let idx_fmt = if use_u16 { wgpu::IndexFormat::Uint16 } else { wgpu::IndexFormat::Uint32 };
-        let est_geom_bytes = b.mesh.verts.len() * std::mem::size_of::<GpuVertex>()
-            + b.mesh.tris.len() * if use_u16 { 6 } else { 12 }
-            + b.instances.len() * std::mem::size_of::<GpuInstance>();
-        if !is_terrain && (self.vram_oom || self.geom_bytes.saturating_add(est_geom_bytes) > MAX_GEOM_BYTES) {
+        if !p.is_terrain && (self.vram_oom || self.geom_bytes.saturating_add(p.geom_bytes) > self.geom_budget) {
+            // no room right now, the streamer may offer it again once the camera is closer
+            if !self.vram_oom {
+                self.unloaded.extend(p.archetype.map(|h| (h, None)));
+            }
             return;
         }
-
-        let normals = compute_smooth_normals(&b.mesh);
-        // placements of one model can span the whole map, sorting them by cell lets each cell be culled on its own
-        const CELL: f32 = 1024.0;
-        let cell_of = |p: Vec3| ((p.x / CELL).floor() as i32, (p.y / CELL).floor() as i32, (p.z / CELL).floor() as i32);
-        let mut placed = b.instances.clone();
-        placed.sort_by_key(|i| cell_of(i.0));
-        let insts: Vec<GpuInstance> = placed
-            .iter()
-            .map(|&(pos, rot, scale, col)| GpuInstance::from_mat4(Mat4::from_scale_rotation_translation(scale, rot, pos), col))
-            .collect();
-
-        let mut by_geom: HashMap<u16, Vec<u32>> = HashMap::new();
-        for (ti, &[i0, i1, i2]) in b.mesh.tris.iter().enumerate() {
-            let g = if b.mesh.texture.is_some() { 0 } else { b.mesh.tri_geom.get(ti).copied().unwrap_or(0) };
-            let v = by_geom.entry(g).or_default();
-            v.push(i0);
-            v.push(i1);
-            v.push(i2);
-        }
-
-        let gv: Vec<GpuVertex> = b
-            .mesh
-            .verts
-            .iter()
-            .enumerate()
-            .map(|(i, &pos)| GpuVertex {
-                pos,
-                normal: normals[i],
-                uv: b.mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
-            })
-            .collect();
 
         self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let inst_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("m_inst"),
-            contents: bytemuck::cast_slice(&insts),
+            contents: bytemuck::cast_slice(&p.insts),
             usage: wgpu::BufferUsages::VERTEX,
         });
         let vb = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("m_vb"),
-            contents: bytemuck::cast_slice(&gv),
+            contents: bytemuck::cast_slice(&p.verts),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        let mut ibs = Vec::with_capacity(by_geom.len());
-        for (g, indices) in by_geom {
-            let ib = if use_u16 {
-                let idx16: Vec<u16> = indices.iter().map(|&i| i as u16).collect();
+        let ibs: Vec<wgpu::Buffer> = p
+            .geoms
+            .iter()
+            .map(|g| {
                 self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("m_ib16"),
-                    contents: bytemuck::cast_slice(&idx16),
+                    label: Some("m_ib"),
+                    contents: g.indices.bytes(),
                     usage: wgpu::BufferUsages::INDEX,
                 })
-            } else {
-                self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("m_ib32"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                })
-            };
-            ibs.push((g, indices.len() as u32, ib));
-        }
+            })
+            .collect();
         if let Some(err) = pollster_block_on(self.device.pop_error_scope()) {
             self.vram_oom = true;
             eprintln!(
@@ -1276,84 +1542,148 @@ impl GpuState {
             return;
         }
 
-        let mut lmin = Vec3::splat(f32::MAX);
-        let mut lmax = Vec3::splat(f32::MIN);
-        for v in &b.mesh.verts {
-            let p = Vec3::from_array(*v);
-            lmin = lmin.min(p);
-            lmax = lmax.max(p);
-        }
-        let local_center = (lmin + lmax) * 0.5;
-        let local_rad = ((lmax - lmin) * 0.5).length();
-        // one entry per run of placements in the same cell: first instance, count, bounds, largest copy
-        let mut cells: Vec<(u32, u32, Vec3, f32, f32)> = Vec::new();
-        let mut start = 0usize;
-        while start < placed.len() {
-            let key = cell_of(placed[start].0);
-            let mut end = start;
-            let mut wmin = Vec3::splat(f32::MAX);
-            let mut wmax = Vec3::splat(f32::MIN);
-            let mut obj_radius = 0.0f32;
-            while end < placed.len() && cell_of(placed[end].0) == key {
-                let (pos, rot, scale, _) = placed[end];
-                let c = pos + rot * (local_center * scale);
-                let r = local_rad * scale.abs().max_element();
-                wmin = wmin.min(c - Vec3::splat(r));
-                wmax = wmax.max(c + Vec3::splat(r));
-                obj_radius = obj_radius.max(r);
-                end += 1;
-            }
-            cells.push((start as u32, (end - start) as u32, (wmin + wmax) * 0.5, ((wmax - wmin) * 0.5).length().max(1.0), obj_radius.max(1.0)));
-            start = end;
-        }
+        let owner = self.next_owner;
+        self.next_owner = self.next_owner.wrapping_add(1);
+        let mut model = LoadedModel {
+            archetype: p.archetype,
+            geom_bytes: p.geom_bytes,
+            tris: p.tri_count * p.insts.len(),
+            instances: p.insts.len(),
+            // a fresh model starts most of the idle window back, one that never shows is the first to go
+            last_drawn: self.frame_idx.saturating_sub(self.evict_idle_frames.saturating_sub(EVICT_FRESH_FRAMES)),
+            own_tex_bytes: 0,
+            tex_keys: Vec::new(),
+        };
 
-        for (g, index_count, ib) in ibs {
-            let shared = if b.mesh.texture.is_some() { None } else { b.mesh.geom_materials.get(g as usize).and_then(|m| m.texture.clone()) };
-            let tex = b.mesh.texture.as_ref().or(shared.as_deref());
-            let tex_bg = match tex {
-                Some(t) if self.tex_bytes < 512 * 1024 * 1024 => {
-                    // materials that share a decoded texture share one upload
-                    let key = t.pixels.as_ptr() as usize;
-                    match self.tex_uploads.get(&key).filter(|_| shared.is_some()) {
-                        Some(bg) => bg.clone(),
-                        None => {
-                            let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128);
-                            self.tex_bytes += bytes;
-                            if let Some(keep) = shared.clone() {
-                                // holding the texture keeps its address from being reused by another one
-                                self.tex_keep.push(keep);
-                                self.tex_uploads.insert(key, bg.clone());
-                            }
-                            bg
-                        }
-                    }
+        for (geom, ib) in p.geoms.iter().zip(ibs) {
+            let tex_bg = if let Some(t) = p.own_texture.as_ref().filter(|_| self.tex_bytes < MAX_TEX_BYTES) {
+                let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128);
+                self.tex_bytes += bytes;
+                model.own_tex_bytes += bytes;
+                bg
+            } else if let Some(t) = geom.texture.as_ref() {
+                // materials that share a decoded texture share one upload
+                let key = t.pixels.as_ptr() as usize;
+                if !self.tex_uploads.contains_key(&key) && self.tex_bytes < MAX_TEX_BYTES {
+                    let (bg, bytes) = upload_texture(&self.device, &self.queue, &self.tex_bgl, &self.tex_samp, t, 128);
+                    self.tex_bytes += bytes;
+                    self.tex_uploads.insert(key, SharedTex { bg, _keep: Arc::clone(t), bytes, users: 0 });
                 }
-                _ => self.white_bg.clone(),
+                match self.tex_uploads.get_mut(&key) {
+                    Some(shared) => {
+                        shared.users += 1;
+                        model.tex_keys.push(key);
+                        shared.bg.clone()
+                    }
+                    None => self.white_bg.clone(),
+                }
+            } else {
+                self.white_bg.clone()
             };
 
-            for &(inst_first, inst_count, bound_center, bound_radius, obj_radius) in &cells {
+            for c in &p.cells {
                 self.batches.push(GpuMeshBatch {
                     vb: vb.clone(),
                     ib: ib.clone(),
                     inst_buf: inst_buf.clone(),
-                    index_count,
-                    index_format: idx_fmt,
-                    inst_first,
-                    inst_count,
+                    index_count: geom.indices.len() as u32,
+                    index_format: geom.indices.format(),
+                    inst_first: c.inst_first,
+                    inst_count: c.inst_count,
                     tex_bind_group: tex_bg.clone(),
-                    bound_center,
-                    bound_radius,
-                    obj_radius,
-                    is_box: b.mesh.name == "__placeholder_boxes__",
-                    is_terrain,
+                    bound_center: c.bound_center,
+                    bound_radius: c.bound_radius,
+                    obj_radius: c.obj_radius,
+                    is_box: p.is_box,
+                    is_terrain: p.is_terrain,
+                    owner,
                 });
             }
         }
 
-        self.geom_bytes += est_geom_bytes;
-        self.tri_count += b.mesh.tris.len() * insts.len();
-        self.instance_count += insts.len();
+        self.geom_bytes += model.geom_bytes;
+        self.tri_count += model.tris;
+        self.instance_count += model.instances;
         self.model_count += 1;
+        if let Some(h) = model.archetype {
+            self.by_archetype.insert(h, owner);
+        }
+        self.models.insert(owner, model);
+    }
+
+    // drops idle far away models once geometry passes the high mark, their archetypes go to the unloaded list
+    fn evict_idle(&mut self, cam: Vec3, draw_radius: f32) {
+        let high = self.geom_budget / 100 * EVICT_HIGH_PCT;
+        let low = self.geom_budget / 100 * EVICT_LOW_PCT;
+        if self.geom_bytes <= high || self.frame_idx < self.next_evict_check {
+            return;
+        }
+        // nothing may be idle yet, look again a little later instead of every frame
+        self.next_evict_check = self.frame_idx + 20;
+        // per owner: distance to the nearest placement bounds, widest draw range, whether any cell is inside its range
+        let mut reach: HashMap<u32, (f32, f32, bool)> = HashMap::new();
+        for b in &self.batches {
+            let d = ((b.bound_center - cam).length() - b.bound_radius).max(0.0);
+            let range = draw_dist(b.obj_radius, draw_radius);
+            let e = reach.entry(b.owner).or_insert((f32::MAX, 0.0, false));
+            e.0 = e.0.min(d);
+            e.1 = e.1.max(range);
+            e.2 |= d <= range || b.bound_radius >= 5000.0;
+        }
+        let cands: Vec<EvictCandidate> = self
+            .models
+            .iter()
+            .map(|(&owner, m)| EvictCandidate {
+                owner,
+                bytes: m.geom_bytes,
+                last_drawn: m.last_drawn,
+                dist: reach.get(&owner).map_or(f32::MAX, |r| r.0),
+                pinned: m.archetype.is_none(),
+            })
+            .collect();
+        let victims: std::collections::HashSet<u32> =
+            select_evictions(&cands, self.geom_bytes, self.frame_idx, high, low, self.evict_idle_frames).into_iter().collect();
+        if victims.is_empty() {
+            return;
+        }
+        // the buffers and unshared bind groups are released with the last batch that holds them
+        self.batches.retain(|b| !victims.contains(&b.owner));
+        for owner in &victims {
+            let Some(m) = self.models.remove(owner) else { continue };
+            self.geom_bytes = self.geom_bytes.saturating_sub(m.geom_bytes);
+            self.tri_count = self.tri_count.saturating_sub(m.tris);
+            self.instance_count = self.instance_count.saturating_sub(m.instances);
+            self.model_count = self.model_count.saturating_sub(1);
+            self.tex_bytes = self.tex_bytes.saturating_sub(m.own_tex_bytes);
+            for key in m.tex_keys {
+                // a shared upload goes only when no loaded model draws with it any more
+                let Some(shared) = self.tex_uploads.get_mut(&key) else { continue };
+                shared.users = shared.users.saturating_sub(1);
+                if shared.users == 0 {
+                    self.tex_bytes = self.tex_bytes.saturating_sub(shared.bytes);
+                    self.tex_uploads.remove(&key);
+                }
+            }
+            if let Some(h) = m.archetype {
+                self.by_archetype.remove(&h);
+                // out of view inside its draw range it only has to come closer, beyond the range it also has to get near it
+                let limit = match reach.get(owner) {
+                    Some(&(_, range, false)) => range + RELOAD_MARGIN,
+                    _ => f32::MAX,
+                };
+                self.unloaded.push((h, Some(limit)));
+            }
+        }
+    }
+
+    // stamps the owner of a drawn batch, batches of one model sit next to each other so repeats are skipped
+    fn mark_drawn(models: &mut HashMap<u32, LoadedModel>, last_owner: &mut Option<u32>, owner: u32, frame: u64) {
+        if *last_owner != Some(owner) {
+            *last_owner = Some(owner);
+            if let Some(m) = models.get_mut(&owner) {
+                m.last_drawn = frame;
+            }
+        }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -1373,6 +1703,8 @@ struct GpuWorldApp {
     terrain_ref: Option<Arc<WorldMapData>>,
     stream_rx: Receiver<WorldStreamMsg>,
     cam_track: Arc<std::sync::Mutex<(Vec3, u64)>>,
+    // tells the streamer which archetypes are gone
+    unload_tx: mpsc::Sender<UnloadNotice>,
     last_stream_cam: Vec3,
     gpu: Option<GpuState>,
     egui_ctx: eframe::egui::Context,
@@ -1399,12 +1731,19 @@ struct GpuWorldApp {
     last_frame: Instant,
     last_title: Instant,
     smoke_frames: Option<u32>,
+    // geometry budget and idle window for the eviction smoke scene
+    smoke_budget: Option<(usize, u64)>,
     ready: bool,
     failure: Option<String>,
 }
 
 impl GpuWorldApp {
-    fn new(cfg: WorldLaunchConfig, stream_rx: Receiver<WorldStreamMsg>, cam_track: Arc<std::sync::Mutex<(Vec3, u64)>>) -> Self {
+    fn new(
+        cfg: WorldLaunchConfig,
+        stream_rx: Receiver<WorldStreamMsg>,
+        cam_track: Arc<std::sync::Mutex<(Vec3, u64)>>,
+        unload_tx: mpsc::Sender<UnloadNotice>,
+    ) -> Self {
         Self {
             cam_pos: Vec3::from_array(cfg.start_pos),
             last_stream_cam: Vec3::from_array(cfg.start_pos),
@@ -1412,6 +1751,7 @@ impl GpuWorldApp {
             cfg: Some(cfg),
             stream_rx,
             cam_track,
+            unload_tx,
             gpu: None,
             egui_ctx: eframe::egui::Context::default(),
             egui_events: Vec::new(),
@@ -1436,6 +1776,7 @@ impl GpuWorldApp {
             last_frame: Instant::now(),
             last_title: Instant::now(),
             smoke_frames: None,
+            smoke_budget: None,
             ready: false,
             failure: None,
         }
@@ -1487,8 +1828,13 @@ impl ApplicationHandler for GpuWorldApp {
             map_count: 0,
             start_pos: [0.0, 0.0, 120.0],
         });
-        self.gpu = Some(GpuState::new(win, &cfg));
-        self.gpu.as_ref().unwrap().window.request_redraw();
+        let mut gpu = GpuState::new(win, cfg);
+        if let Some((budget, idle_frames)) = self.smoke_budget {
+            gpu.geom_budget = budget;
+            gpu.evict_idle_frames = idle_frames;
+        }
+        gpu.window.request_redraw();
+        self.gpu = Some(gpu);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1582,6 +1928,9 @@ impl ApplicationHandler for GpuWorldApp {
                 self.last_frame = now;
 
                 if let Some(g) = &mut self.gpu {
+                    // room is made first so the uploads below are not turned away
+                    // a lowered radius setting must not cost models the default radius would show
+                    g.evict_idle(self.cam_pos, self.draw_radius.max(6000.0));
                     let upload_start = Instant::now();
                     for _ in 0..8 {
                         if upload_start.elapsed().as_micros() >= 6000 {
@@ -1589,11 +1938,14 @@ impl ApplicationHandler for GpuWorldApp {
                         }
                         let Ok(msg) = self.stream_rx.try_recv() else { break };
                         match msg {
-                            WorldStreamMsg::Batch(batch) => g.add_batch(&batch),
+                            WorldStreamMsg::Batch(batch) => g.add_prepared(batch),
                             WorldStreamMsg::MapCount(mc) => g.map_count = mc,
                             WorldStreamMsg::TotalArchetypes(t) => g.stream_total = t,
                             WorldStreamMsg::ArchetypeDone => g.stream_done += 1,
                         }
+                    }
+                    for (h, hold) in g.unloaded.drain(..) {
+                        let _ = self.unload_tx.send((h, self.cam_pos, hold));
                     }
                 }
 
@@ -1712,6 +2064,8 @@ impl ApplicationHandler for GpuWorldApp {
                     });
                     rp.set_pipeline(&g.shadow_pipeline);
                     rp.set_bind_group(0, &g.uniform_bg, &[]);
+                    // casting a shadow counts as drawn, the caster may sit just outside the view
+                    let mut last_owner = None;
                     for b in &g.batches {
                         if b.obj_radius < 3.0 {
                             continue;
@@ -1719,6 +2073,7 @@ impl ApplicationHandler for GpuWorldApp {
                         if b.bound_radius < 5000.0 && (b.bound_center - light_target).length_squared() > (1200.0 + b.bound_radius).powi(2) {
                             continue;
                         }
+                        GpuState::mark_drawn(&mut g.models, &mut last_owner, b.owner, g.frame_idx);
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
@@ -1757,6 +2112,7 @@ impl ApplicationHandler for GpuWorldApp {
 
                     rp.set_pipeline(&g.main_pipeline);
                     let mut drawn = 0usize;
+                    let mut last_owner = None;
                     for b in &g.batches {
                         if b.is_box && !self.show_boxes {
                             continue;
@@ -1770,8 +2126,7 @@ impl ApplicationHandler for GpuWorldApp {
                                 continue;
                             }
                             let d2 = to_b.length_squared();
-                            let base_d: f32 = if b.obj_radius > 35.0 { 6500.0 } else if b.obj_radius < 2.0 { 450.0 } else { 3200.0 };
-                            let max_d = base_d.min(self.draw_radius).max(if b.obj_radius > 35.0 { self.draw_radius } else { 450.0 });
+                            let max_d = draw_dist(b.obj_radius, self.draw_radius);
                             if d2 > (max_d + b.bound_radius).powi(2) {
                                 continue;
                             }
@@ -1780,6 +2135,7 @@ impl ApplicationHandler for GpuWorldApp {
                                 break;
                             }
                         }
+                        GpuState::mark_drawn(&mut g.models, &mut last_owner, b.owner, g.frame_idx);
                         rp.set_bind_group(1, &b.tex_bind_group, &[]);
                         rp.set_vertex_buffer(0, b.vb.slice(..));
                         rp.set_vertex_buffer(1, b.inst_buf.slice(..));
@@ -1978,7 +2334,7 @@ mod terrain_sampling_tests {
         };
         let (_, rx) = mpsc::sync_channel(16);
         let start = Vec3::from_array(cfg.start_pos);
-        let app = GpuWorldApp::new(cfg, rx, Arc::new(std::sync::Mutex::new((start, 1))));
+        let app = GpuWorldApp::new(cfg, rx, Arc::new(std::sync::Mutex::new((start, 1))), mpsc::channel().0);
         assert_eq!(app.cam_pos, start);
         assert!((app.sample_terrain_z(0.0, 10.0) - 10.0).abs() < 0.001);
         assert!((app.sample_terrain_z(0.0, -10.0) - 200.0).abs() < 0.001);
@@ -1993,5 +2349,133 @@ mod startup_tests {
         let missing = Path::new("target/missing-world-regression.rpf");
         assert!(!missing.exists());
         assert!(run_gpu_world_cli(Some(missing), None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod prepare_tests {
+    use super::*;
+
+    fn quad(tri_geom: Vec<u16>, texture: Option<Texture2D>) -> Mesh3D {
+        Mesh3D::from_parts(
+            "quad".into(),
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0]],
+            vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            vec![[0, 1, 2], [1, 3, 2]],
+            tri_geom,
+            vec![],
+            texture,
+            String::new(),
+            2,
+            1,
+            String::new(),
+        )
+    }
+
+    fn at(x: f32, scale: f32) -> (Vec3, Quat, Vec3, [f32; 4]) {
+        (Vec3::new(x, 10.0, 0.0), Quat::IDENTITY, Vec3::splat(scale), [1.0; 4])
+    }
+
+    #[test]
+    fn splits_materials_and_sorts_instances_into_cells() {
+        // the far placement comes first so the cell sort has to move it behind the two near ones
+        let input = WorldBatchInput { mesh: quad(vec![0, 1], None), instances: vec![at(2100.0, 2.0), at(10.0, 1.0), at(30.0, 1.0)] };
+        let p = prepare_batch(input, Some(0xABCD)).unwrap();
+        assert_eq!(p.archetype, Some(0xABCD));
+        assert!(!p.is_terrain && !p.is_box && p.own_texture.is_none());
+        assert_eq!((p.verts.len(), p.insts.len(), p.tri_count), (4, 3, 2));
+        assert_eq!(p.geom_bytes, 4 * 32 + 2 * 6 + 3 * 80);
+        assert_eq!(p.verts[3].pos, [1.0, 1.0, 0.0]);
+        assert_eq!(p.verts[3].uv, [1.0, 1.0]);
+        assert_eq!(p.verts[3].normal, [0.0, 0.0, 1.0]);
+
+        assert_eq!(p.geoms.len(), 2);
+        assert!(matches!(&p.geoms[0].indices, PreparedIndices::U16(v) if v == &[0, 1, 2]));
+        assert!(matches!(&p.geoms[1].indices, PreparedIndices::U16(v) if v == &[1, 3, 2]));
+        assert_eq!(p.geoms[0].indices.format(), wgpu::IndexFormat::Uint16);
+        assert_eq!(p.geoms[0].indices.bytes().len(), 6);
+
+        assert_eq!(p.insts.iter().map(|i| i.model_3[0]).collect::<Vec<_>>(), [10.0, 30.0, 2100.0]);
+        assert_eq!(p.cells.len(), 2);
+        let (near, far) = (&p.cells[0], &p.cells[1]);
+        assert_eq!((near.inst_first, near.inst_count), (0, 2));
+        assert_eq!((far.inst_first, far.inst_count), (2, 1));
+        // the quad is centred on 0.5 0.5 with a half diagonal of sqrt 0.5
+        let r = 0.5f32.sqrt();
+        assert!(near.bound_center.distance(Vec3::new(20.5, 10.5, 0.0)) < 1e-3);
+        assert!((near.bound_radius - Vec3::new(10.0 + r, r, r).length()).abs() < 1e-3);
+        assert_eq!(near.obj_radius, 1.0);
+        assert!(far.bound_center.distance(Vec3::new(2101.0, 11.0, 0.0)) < 1e-3);
+        assert!((far.bound_radius - Vec3::splat(2.0 * r).length()).abs() < 1e-3);
+        assert!((far.obj_radius - 2.0 * r).abs() < 1e-4);
+    }
+
+    #[test]
+    fn large_meshes_use_wide_indices() {
+        let n = u16::MAX as usize + 2;
+        let mesh = Mesh3D::from_parts(
+            "big".into(),
+            (0..n).map(|i| [i as f32, (i % 7) as f32, 0.0]).collect(),
+            Vec::new(),
+            vec![[0, 1, n as u32 - 1]],
+            vec![0],
+            vec![],
+            None,
+            String::new(),
+            1,
+            1,
+            String::new(),
+        );
+        let p = prepare_batch(WorldBatchInput { mesh, instances: vec![at(0.0, 1.0)] }, None).unwrap();
+        assert!(matches!(&p.geoms[0].indices, PreparedIndices::U32(v) if v == &[0, 1, n as u32 - 1]));
+        assert_eq!(p.geoms[0].indices.format(), wgpu::IndexFormat::Uint32);
+        assert_eq!(p.geom_bytes, n * 32 + 12 + 80);
+        assert_eq!(p.verts[5].uv, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn own_texture_keeps_one_material_and_empty_input_is_skipped() {
+        let tex = Texture2D::new(1, 1, vec![eframe::egui::Color32::WHITE]);
+        let p = prepare_batch(WorldBatchInput { mesh: quad(vec![0, 1], Some(tex)), instances: vec![at(0.0, 1.0)] }, None).unwrap();
+        assert!(p.own_texture.is_some());
+        assert_eq!(p.geoms.len(), 1);
+        assert_eq!(p.geoms[0].indices.len(), 6);
+        assert!(p.geoms[0].texture.is_none());
+        assert!(prepare_batch(WorldBatchInput { mesh: quad(vec![0, 1], None), instances: Vec::new() }, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+
+    fn cand(owner: u32, bytes: usize, last_drawn: u64, dist: f32) -> EvictCandidate {
+        EvictCandidate { owner, bytes, last_drawn, dist, pinned: false }
+    }
+
+    #[test]
+    fn idle_models_go_farthest_first_until_the_low_mark() {
+        let mut cands = vec![
+            cand(1, 10, 100, 500.0),
+            cand(2, 10, 100, 4000.0),
+            // drawn a moment ago
+            cand(3, 10, 900, 9000.0),
+            cand(4, 10, 100, 2000.0),
+            cand(5, 10, 0, 20000.0),
+            cand(6, 10, 100, 100.0),
+        ];
+        // terrain and placeholder boxes stay whatever their age and distance
+        cands[4].pinned = true;
+        assert_eq!(select_evictions(&cands, 90, 1000, 85, 65, 600), [2, 4, 1]);
+        // nothing happens until the high mark is passed
+        assert!(select_evictions(&cands, 85, 1000, 85, 65, 600).is_empty());
+    }
+
+    #[test]
+    fn recently_drawn_models_are_never_chosen() {
+        // exactly at the idle window still counts as recent
+        let cands = [cand(1, 50, 400, 8000.0), cand(2, 50, 999, 9000.0)];
+        assert!(select_evictions(&cands, 100, 1000, 85, 65, 600).is_empty());
+        assert_eq!(select_evictions(&cands, 100, 1001, 85, 65, 600), [1]);
     }
 }
