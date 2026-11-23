@@ -10,6 +10,7 @@ mod mapdata;
 mod meta7a;
 mod names;
 mod psin;
+mod psin_tree;
 mod psin_xml;
 mod rsc9;
 mod sgd5;
@@ -869,6 +870,9 @@ struct Rpf9App {
     export_busy: Arc<AtomicBool>,
     // the entry on screen is a psin file shown as xml
     psin_selected: bool,
+    // tree view of the selected psin file and whether its xml text is shown instead
+    psin_tree: Option<psin_tree::PsinTree>,
+    psin_as_text: bool,
     export_cancel: Arc<AtomicBool>,
     mv_drawer_open: bool,
     mv_entries: Vec<(usize, ModelCat, String)>,
@@ -1063,6 +1067,8 @@ impl Rpf9App {
             lod_keep_cam: None,
             export_busy: Arc::new(AtomicBool::new(false)),
             psin_selected: false,
+            psin_tree: None,
+            psin_as_text: false,
             export_cancel: Arc::new(AtomicBool::new(false)),
             mv_drawer_open: true,
             mv_entries: Vec::new(),
@@ -1175,6 +1181,7 @@ impl Rpf9App {
         self.tex_from_model = false;
         self.lod_keep_cam = None;
         self.psin_selected = false;
+        self.psin_tree = None;
         self.preview.clear();
         self.last_dock_rect = [0; 4];
         self.mesh3d = None;
@@ -2400,6 +2407,7 @@ impl Rpf9App {
                             Ok(xml) => {
                                 self.preview = xml;
                                 self.psin_selected = true;
+                                self.psin_tree = psin_tree::PsinTree::new(data.clone()).ok();
                             }
                             Err(_) => self.preview = psin::parse_psin(&data),
                         }
@@ -3678,11 +3686,32 @@ impl Rpf9App {
     // export, edit and name tools for the psin file on screen
     fn psin_tools_ui(&mut self, ui: &mut egui::Ui) {
         let complete = !self.preview.contains(PSIN_CUT_MARK);
+        let tree = self.psin_tree.is_some() && !self.psin_as_text;
         ui.horizontal(|ui| {
+            if self.psin_tree.is_some() {
+                ui.selectable_value(&mut self.psin_as_text, false, "Tree").on_hover_text("Blocks and fields as a collapsible tree, values are edited in place");
+                ui.selectable_value(&mut self.psin_as_text, true, "XML text").on_hover_text("The same values as one editable XML text");
+                ui.separator();
+            }
             if ui.button("Export XML…").on_hover_text("Save the whole file as editable XML").clicked() {
                 self.psin_export_xml();
             }
-            if ui
+            if tree {
+                let (edits, invalid) = self.psin_tree.as_ref().map_or((0, 0), |t| (t.edit_count(), t.invalid_edits()));
+                if ui
+                    .add_enabled(edits > 0 && invalid == 0, egui::Button::new(format!("Save {edits} edit(s)…")))
+                    .on_hover_text("Write the edited values into a patched copy of the file")
+                    .on_disabled_hover_text(if invalid > 0 { "Some edited values are not valid for their type" } else { "Nothing is edited yet" })
+                    .clicked()
+                {
+                    self.psin_save_tree();
+                }
+                if edits > 0 && ui.button("Discard edits").clicked() {
+                    if let Some(t) = self.psin_tree.as_mut() {
+                        t.clear_edits();
+                    }
+                }
+            } else if ui
                 .add_enabled(complete, egui::Button::new("Save edits shown here…"))
                 .on_hover_text("Write the values edited in the text below into a patched copy of the file")
                 .on_disabled_hover_text("The view is cut short for this file: export the XML, edit it, then use Apply XML file")
@@ -3737,9 +3766,19 @@ impl Rpf9App {
     fn psin_apply_xml(&self, xml: String) {
         let Some(e) = self.selected_entry() else { return };
         let res = read_entry_bytes(&e).map_err(|err| err.to_string()).and_then(|data| psin_xml::apply_xml(&data, &xml));
+        self.psin_save_patched(&e, res);
+    }
+
+    // saves a copy of the selected file with the edits made in the tree view
+    fn psin_save_tree(&self) {
+        let (Some(e), Some(tree)) = (self.selected_entry(), self.psin_tree.as_ref()) else { return };
+        self.psin_save_patched(&e, tree.patched());
+    }
+
+    fn psin_save_patched(&self, e: &RpfEntry, res: Result<psin_xml::Applied, String>) {
         let status = match res {
-            Err(err) => format!("XML not applied: {err}"),
-            Ok(done) if done.changes.is_empty() => "The XML has the same values as the file, nothing to save".to_string(),
+            Err(err) => format!("Edits not applied: {err}"),
+            Ok(done) if done.changes.is_empty() => "The values are the same as in the file, nothing to save".to_string(),
             Ok(done) => {
                 let name = format!("{}.patched.psin", safe_file_name(e.name.trim_end_matches(".psin")));
                 match rfd::FileDialog::new().set_file_name(name).save_file() {
@@ -5871,9 +5910,14 @@ impl eframe::App for Rpf9App {
                 if self.psin_selected {
                     self.psin_tools_ui(ui);
                 }
-                egui::ScrollArea::both().show(ui, |ui| {
-                    ui.add(egui::TextEdit::multiline(&mut self.preview).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
-                });
+                match self.psin_tree.as_mut().filter(|_| self.psin_selected && !self.psin_as_text) {
+                    Some(tree) => tree.ui(ui),
+                    None => {
+                        egui::ScrollArea::both().show(ui, |ui| {
+                            ui.add(egui::TextEdit::multiline(&mut self.preview).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY));
+                        });
+                    }
+                }
             }
         });
         } // end Explorer tab

@@ -8,7 +8,10 @@ use crate::names;
 use crate::psin::{joaat, parse_iff_chunks, parse_lenm, parse_lsch, PsinEnum, PsinField, PsinStruct};
 
 const ELEMENT_NAME: u32 = 0x100;
-const MAX_DEPTH: usize = 8;
+// inline structs nest a dozen deep in real files, the cap only stops a schema that contains itself
+const MAX_DEPTH: usize = 32;
+// depth the fields of a block item are written at
+const ITEM_DEPTH: usize = 3;
 
 struct Layout<'a> {
     data: &'a [u8],
@@ -509,7 +512,7 @@ impl Writer<'_> {
                     break;
                 }
                 let _ = writeln!(self.out, "    <item i=\"{k}\">");
-                self.struct_fields(3, st, start + k * isize, (start + (k + 1) * isize).min(end));
+                self.struct_fields(ITEM_DEPTH, st, start + k * isize, (start + (k + 1) * isize).min(end));
                 self.out.push_str("    </item>\n");
             }
         } else if tag == 0x10 {
@@ -717,24 +720,196 @@ pub fn apply_xml(data: &[u8], xml: &str) -> Result<Applied, String> {
         let (Some(ty), Some(o), Some(v)) = (a.get("t"), a.get("o"), a.get("v")) else { continue };
         let label = a.get("n").or(a.get("i")).cloned().unwrap_or_default();
         let pos = parse_int(o).and_then(|p| usize::try_from(p).ok()).ok_or_else(|| format!("{label}: bad offset {o}"))?;
-        let bytes = encode(ty, v).map_err(|e| format!("{label} at {o}: {e}"))?;
-        if pos < lo || pos + bytes.len() > hi {
-            return Err(format!("{label}: offset {o} is outside the data"));
+        write_value(&mut out, (lo, hi), &label, ty, pos, v, &mut changes)?;
+    }
+    Ok(Applied { data: out, changes })
+}
+
+// stores one value at its file offset and notes the change when the bytes differ
+fn write_value(out: &mut [u8], (lo, hi): (usize, usize), label: &str, ty: &str, pos: usize, v: &str, changes: &mut Vec<String>) -> Result<(), String> {
+    let bytes = encode(ty, v).map_err(|e| format!("{label} at 0x{pos:x}: {e}"))?;
+    if pos < lo || pos + bytes.len() > hi {
+        return Err(format!("{label}: offset 0x{pos:x} is outside the data"));
+    }
+    if out[pos..pos + bytes.len()] != bytes[..] {
+        // a bool stored as something other than 0 or 1 reads as true and is left alone
+        if ty == "bool" && bytes[0] == 1 && out[pos] != 0 {
+            return Ok(());
         }
-        if out[pos..pos + bytes.len()] != bytes[..] {
-            // a bool stored as something other than 0 or 1 reads as true and is left alone
-            if ty == "bool" && bytes[0] == 1 && out[pos] != 0 {
-                continue;
+        changes.push(format!("{label} ({ty}) at 0x{pos:x} = {v}"));
+        out[pos..pos + bytes.len()].copy_from_slice(&bytes);
+    }
+    Ok(())
+}
+
+// one line of the tree view
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Value {
+    pub label: String,
+    pub ty: String,
+    // file offset of a value that can be edited in place
+    pub offset: Option<usize>,
+    pub text: String,
+    // what the value stands for: an enum value name, the text behind a hash
+    pub note: String,
+    // block and byte offset a pointer leads to
+    pub to: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Node {
+    Value(Value),
+    Group { label: String, kind: String, children: Vec<Node> },
+}
+
+pub struct BlockInfo {
+    pub label: String,
+    // items of a struct block, values of a plain one, strings of a text block
+    pub count: usize,
+    pub item_size: usize,
+    pub size: usize,
+}
+
+// the blocks of a file without their content
+pub fn outline(data: &[u8]) -> Result<Vec<BlockInfo>, String> {
+    let l = layout(data)?;
+    Ok(l.blocks
+        .iter()
+        .map(|&(tag, size, off)| {
+            let (label, count, item_size) = if let Some(st) = l.structs.get(&tag) {
+                let isize = (st.size as usize).max(1);
+                (name_of(tag), if st.size == 0 { 1 } else { size / isize }, isize)
+            } else if tag == 0x10 {
+                let bytes = &data[l.payload + off..l.payload + off + size];
+                ("chars".to_string(), bytes.split(|&c| c == 0).filter(|s| !s.is_empty()).count(), 0)
+            } else if tag == 0x07 {
+                ("ptr".to_string(), size / 8, 8)
+            } else if let Some((ty, esize)) = scalar(tag, usize::MAX).filter(|_| tag < 0x100) {
+                (ty.to_string(), size / esize, esize)
+            } else {
+                (format!("raw:0x{tag:x}"), 0, 0)
+            };
+            BlockInfo { label, count, item_size, size }
+        })
+        .collect())
+}
+
+fn parse_target(to: &str) -> Option<(usize, usize)> {
+    let (block, off) = to.split_once('+')?;
+    Some((block.parse().ok()?, usize::try_from(parse_int(off)?).ok()?))
+}
+
+fn node_label(a: &HashMap<&str, String>) -> String {
+    a.get("n").cloned().or_else(|| a.get("i").map(|i| format!("[{i}]"))).unwrap_or_default()
+}
+
+// the lines the xml writer produced for one item as tree nodes
+fn parse_nodes(text: &str) -> Vec<Node> {
+    let mut stack: Vec<(String, String, Vec<Node>)> = vec![(String::new(), String::new(), Vec::new())];
+    let close = |stack: &mut Vec<(String, String, Vec<Node>)>| {
+        let (label, kind, children) = stack.pop().unwrap();
+        stack.last_mut().unwrap().2.push(Node::Group { label, kind, children });
+    };
+    for line in text.lines().map(str::trim_start) {
+        if line.starts_with("</") {
+            if stack.len() > 1 {
+                close(&mut stack);
             }
-            changes.push(format!("{label} ({ty}) at {o} = {v}"));
-            out[pos..pos + bytes.len()].copy_from_slice(&bytes);
+        } else if let Some(rest) = line.strip_prefix("<s") {
+            let a = attrs(rest);
+            stack.push((node_label(&a), a.get("type").cloned().unwrap_or_default(), Vec::new()));
+        } else if let Some(rest) = line.strip_prefix("<a") {
+            let a = attrs(rest);
+            stack.push((node_label(&a), format!("{} values", a.get("count").map_or("?", |c| c.as_str())), Vec::new()));
+        } else if let Some(rest) = line.strip_prefix("<f") {
+            let a = attrs(rest);
+            let ty = a.get("t").cloned().unwrap_or_default();
+            let mut v = Value {
+                label: node_label(&a),
+                offset: a.get("o").and_then(|o| parse_int(o)).and_then(|o| usize::try_from(o).ok()),
+                text: a.get("v").or(a.get("text")).or(a.get("hex")).cloned().unwrap_or_default(),
+                note: a.get("e").or(a.get("s")).cloned().unwrap_or_default(),
+                ..Value::default()
+            };
+            if ty == "array" {
+                v.text = format!("{} values", a.get("count").map_or("?", |c| c.as_str()));
+            }
+            match a.get("to").map(String::as_str) {
+                Some("null") => v.note = "null".into(),
+                Some(to) => match parse_target(to) {
+                    Some(t) => v.to = Some(t),
+                    None => v.note = "pointer leads nowhere".into(),
+                },
+                None => {}
+            }
+            v.ty = ty;
+            stack.last_mut().unwrap().2.push(Node::Value(v));
         }
+    }
+    while stack.len() > 1 {
+        close(&mut stack);
+    }
+    stack.pop().unwrap().2
+}
+
+// tree nodes of the given items of one block, the same values the xml shows
+pub fn items(data: &[u8], block: usize, first: usize, count: usize) -> Result<Vec<Vec<Node>>, String> {
+    let l = layout(data)?;
+    let &(tag, size, off) = l.blocks.get(block).ok_or("No such block")?;
+    let start = l.payload + off;
+    let end = start + size;
+    let mut w = Writer { l: &l, out: String::new(), limit: 0, cut: false };
+    let mut out = Vec::new();
+    let last = first.saturating_add(count);
+    if let Some(st) = l.structs.get(&tag) {
+        let isize = (st.size as usize).max(1);
+        let total = if st.size == 0 { 1 } else { size / isize };
+        for k in first..last.min(total) {
+            w.out.clear();
+            w.struct_fields(ITEM_DEPTH, st, start + k * isize, (start + (k + 1) * isize).min(end));
+            out.push(parse_nodes(&w.out));
+        }
+    } else if tag == 0x10 {
+        for (k, s) in data[start..end].split(|&c| c == 0).filter(|s| !s.is_empty()).enumerate().skip(first).take(count) {
+            out.push(vec![Node::Value(Value { label: format!("[{k}]"), ty: "text".into(), text: String::from_utf8_lossy(s).into_owned(), ..Value::default() })]);
+        }
+    } else if tag == 0x07 {
+        for k in first..last.min(size / 8) {
+            w.out.clear();
+            let _ = write!(w.out, "<f i=\"{k}\" t=\"ptr\"");
+            w.to_attr(rd64(data, start + k * 8));
+            w.out.push_str("/>\n");
+            out.push(parse_nodes(&w.out));
+        }
+    } else if let Some((ty, esize)) = scalar(tag, usize::MAX).filter(|_| tag < 0x100) {
+        for k in first..last.min(size / esize) {
+            w.out.clear();
+            w.scalar(0, &format!(" i=\"{k}\""), ty, esize, start + k * esize, 0);
+            out.push(parse_nodes(&w.out));
+        }
+    }
+    Ok(out)
+}
+
+// whether the text is a valid value of the type
+pub fn check(ty: &str, v: &str) -> Result<(), String> {
+    encode(ty, v).map(|_| ())
+}
+
+// writes edited values, given as file offset, type, text and label, into a copy of the file
+pub fn patch<'a>(data: &[u8], edits: impl IntoIterator<Item = (usize, &'a str, &'a str, &'a str)>) -> Result<Applied, String> {
+    let l = layout(data)?;
+    let bounds = (l.payload, l.payload + l.payload_len);
+    let mut out = data.to_vec();
+    let mut changes = Vec::new();
+    for (pos, ty, v, label) in edits {
+        write_value(&mut out, bounds, label, ty, pos, v, &mut changes)?;
     }
     Ok(Applied { data: out, changes })
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn section(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
@@ -749,7 +924,7 @@ mod tests {
     }
 
     // one struct holding one of each common value, a second block of floats it points at
-    fn sample() -> Vec<u8> {
+    pub(crate) fn sample() -> Vec<u8> {
         let st = joaat("TestThing");
         let mut item = vec![0u8; 64];
         item[8..12].copy_from_slice(&1630.0f32.to_bits().to_le_bytes());
